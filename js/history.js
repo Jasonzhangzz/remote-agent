@@ -5,6 +5,8 @@ const SC = { key: null, items: new Map(), sig: new Map(), collapsed: new Set(), 
 const SC_MAX = 8000;
 const acpNum = id => { const m = /^acp(\d+)/.exec(id || ''); return m ? Number(m[1]) : -1; };
 let scDbP = null;
+const scPending = new Map(), scItemBytes = new WeakMap();
+let scSaveFrame = 0;
 function scDb() {
   if (!scDbP) scDbP = new Promise((res, rej) => {
     if (!window.indexedDB) return rej(new Error('no indexedDB'));
@@ -29,7 +31,8 @@ const chatPreviewReady = idbGet('chat-previews').then(entries => {
 let chatPreviewTimer = 0;
 function cacheChat(sel, chat) {
   lruPut(chatBySel, chatCacheKey(sel), chat, 12);
-  if (!chatPreviewTimer) chatPreviewTimer = setTimeout(() => {
+  if (!chatPreviewTimer) chatPreviewTimer = setTimeout(function savePreview() {
+    if (chatScrolling || chatTouching) { chatPreviewTimer = setTimeout(savePreview, 250); return; }
     chatPreviewTimer = 0;
     idbPut('chat-previews', [...chatBySel].map(([key, value]) => [key, { ...value, items: value.items.slice(-400) }]));
   }, 1000);
@@ -44,7 +47,10 @@ function queueChatRender(chat = queuedChat?.chat || lastChat, stale = queuedChat
     if (windowReady && (!next.sel || !viewSel || next.sel === viewSel)) {
       renderChat(next.chat, next.stale);
       if (next.chat && (!next.stale || next.chat.imagePreview) && !deferredScrollRender
-          && windowReady && (!next.sel || next.sel === viewSel)) connContentReady();
+          && windowReady && (!next.sel || next.sel === viewSel)) {
+        if (!next.chat.readonly) rememberConversation();
+        connContentReady();
+      }
     }
   });
 }
@@ -66,6 +72,8 @@ function scSetTitle(key, title) {
   store.set('scTitles', JSON.stringify(scTitles));
 }
 const scGet = k => {
+  const pending = k.startsWith('h:') && scPending.get(k.slice(2));
+  if (pending) return Promise.resolve(scSnapshot(pending));
   const n = nativeHist();
   if (!n) return idbGet(k);
   return Promise.resolve(parseJson(k.startsWith('h:') ? n.histGet(k.slice(2)) : n.histMeta(k.slice(2))));
@@ -85,12 +93,18 @@ const htmlText = h => h.replace(/<[^>]+>/g, ' ').replace(/&lt;/g, '<').replace(/
 const scIndex = items => items.flatMap(it => it.k === 'human' && it.t ? [{ id: it.i, role: 'human', body: it.t.slice(0, 4000) }]
   : it.k === 'assistant' && it.h ? [{ id: it.i, role: 'assistant', body: htmlText(it.h).slice(0, 6000) }] : []);
 function scSave(key, items, collapsed) {
-  const json = JSON.stringify({ items, collapsed });
-  const meta = { n: items.length, bytes: json.length, updated: Date.now() };
   const n = nativeHist();
-  if (n) return n.histPut(key, json, JSON.stringify(meta), JSON.stringify(scIndex(items)));
-  idbPut('h:' + key, { items, collapsed });
-  idbPut('m:' + key, meta);
+  const updated = Date.now();
+  if (n) {
+    const json = JSON.stringify({ items, collapsed });
+    return n.histPut(key, json, JSON.stringify({ n: items.length, bytes: json.length, updated }), JSON.stringify(scIndex(items)));
+  }
+  const bytes = JSON.stringify({ items: [], collapsed }).length + Math.max(0, items.length - 1) + items.reduce((sum, it) => {
+    let size = scItemBytes.get(it);
+    if (size === undefined) { size = JSON.stringify(it).length; scItemBytes.set(it, size); }
+    return sum + size;
+  }, 0);
+  return Promise.all([idbPut('h:' + key, { items, collapsed }), idbPut('m:' + key, { n: items.length, bytes, updated })]);
 }
 // Sessions saved before the native database existed (IndexedDB) are copied over once.
 async function scMigrate() {
@@ -114,21 +128,47 @@ function scKeep(prev, it) {
   if (it.k === 'tasks' && prev.k === 'tasks' && prev.items && !it.items && prev.done === it.done && prev.total === it.total) return { ...it, items: prev.items };
   return it;
 }
+function scSnapshot(pending) {
+  let items = [...pending.items.values()].sort((a, b) => (a.order ?? acpNum(a.i)) - (b.order ?? acpNum(b.i)));
+  if (items.length > SC_MAX) items = items.slice(-SC_MAX);
+  return { items, collapsed: [...pending.collapsed] };
+}
+let scDrainTimer = 0;
+function scDrain(force = false) {
+  clearTimeout(scDrainTimer);
+  scDrainTimer = 0;
+  if (!force && (chatScrolling || chatTouching)) {
+    scDrainTimer = setTimeout(() => scDrain(), 250);
+    return Promise.resolve();
+  }
+  const saves = [];
+  for (const [key, pending] of scPending) {
+    if (pending.saving) { saves.push(pending.saving); continue; }
+    const { items, collapsed } = scSnapshot(pending);
+    pending.saving = Promise.resolve(scSave(key, items, collapsed)).then(() => {
+      if (scPending.get(key) === pending) scPending.delete(key);
+    });
+    saves.push(pending.saving);
+  }
+  return Promise.all(saves);
+}
 function scFlush() {
   clearTimeout(SC.timer);
   SC.timer = 0;
   if (!SC.key || !SC.dirty) return;
   SC.dirty = false;
-  let items = [...SC.items.values()].sort((a, b) => (a.order ?? acpNum(a.i)) - (b.order ?? acpNum(b.i)));
-  if (items.length > SC_MAX) items = items.slice(-SC_MAX);
-  scSave(SC.key, items, [...SC.collapsed]);
+  scPending.set(SC.key, { items: SC.items, collapsed: new Set(SC.collapsed) });
+  if (!scSaveFrame) scSaveFrame = requestAnimationFrame(() => {
+    scSaveFrame = 0;
+    setTimeout(scDrain, 0);
+  });
 }
 function scDirty() {
   SC.dirty = true;
   if (!SC.timer) SC.timer = setTimeout(scFlush, 3000);
 }
-document.addEventListener('visibilitychange', () => { if (document.hidden) scFlush(); });
-addEventListener('pagehide', scFlush);
+document.addEventListener('visibilitychange', () => { if (document.hidden) { scFlush(); scDrain(true); } });
+addEventListener('pagehide', () => { scFlush(); scDrain(true); });
 function scSwitch(sess) {
   scFlush();
   SC.key = sess ? scKeyFor(sess) : null;
@@ -156,6 +196,7 @@ function scMerge(chat) {
   for (const it of chat.items) {
     const sig = JSON.stringify(it);
     if (SC.sig.get(it.i) === sig && SC.items.has(it.i)) continue;
+    scItemBytes.set(it, sig.length);
     SC.sig.set(it.i, sig);
     SC.items.set(it.i, scKeep(SC.items.get(it.i), it));
     changed = true;
@@ -218,6 +259,7 @@ function scSearch(q) {
   }).join('') : '<div class="hint">没有找到。</div>';
 }
 async function scClear(key) {
+  scPending.delete(key);
   await scDel('h:' + key);
   await scDel('m:' + key);
   if (key === SC.key) {
@@ -245,6 +287,7 @@ function showBgSheet() {
 }
 async function showCacheSheet() {
   scFlush();
+  await scDrain(true);
   const keys = ((await scKeys()) || []).map(String).filter(k => k.startsWith('m:')).map(k => k.slice(2));
   const rows = (await Promise.all(keys.map(async k => {
     const m = await scGet('m:' + k);
@@ -277,6 +320,9 @@ function userSelecting() {
 let deferredRender = false;
 let chatScrolling = false, chatTouching = false, scrollIdle = 0, deferredScrollRender = false, lastScrollTop = 0;
 let historyRequest = null, historyRendering = false, historyExpanded = false, historyArmed = false, historySerial = 0, historyAtEnd = false;
+let pendingHistoryStatus = null;
+let turnNavTimer = 0, turnNavHeld = false, turnNavUser = false, turnNavCursor = null, turnNavPending = null;
+let turnNavPointer = null, turnNavSkipClick = false;
 let restoringChatScroll = false, readingAnchor = null;
 function captureChatAnchor() {
   const top = list.getBoundingClientRect().top;
@@ -287,9 +333,24 @@ function captureChatAnchor() {
     else lo = mid + 1;
   }
   const el = itemsEl.children[lo];
-  return el ? { id: el.dataset.i, top: el.getBoundingClientRect().top - top } : null;
+  return el ? { el, id: el.dataset.i, top: el.getBoundingClientRect().top - top, scrollTop: list.scrollTop } : null;
 }
 let pinnedBottom = false;
+function stabilizeChatReading() {
+  if (readingAnchor) {
+    const el = readingAnchor.el;
+    if (el) {
+      const top = list.scrollTop;
+      // Keep the user's scroll delta; compensate only for layout changes above the anchor.
+      const shift = el.getBoundingClientRect().top - list.getBoundingClientRect().top - readingAnchor.top + top - readingAnchor.scrollTop;
+      if (shift) {
+        list.scrollTop += shift;
+        lastScrollTop += list.scrollTop - top;
+      }
+    }
+  }
+  readingAnchor = captureChatAnchor();
+}
 function restoreChatPosition(anchor, stick = false) {
   restoringChatScroll = true;
   pinnedBottom = !!stick;
@@ -301,14 +362,15 @@ function restoreChatPosition(anchor, stick = false) {
   readingAnchor = stick ? null : captureChatAnchor();
   requestAnimationFrame(() => { restoringChatScroll = false; });
 }
-new ResizeObserver(() => {
-  if (chatScrolling || chatTouching) return;
+const chatSizeObserver = new ResizeObserver(() => {
+  if (chatScrolling || chatTouching) { stabilizeChatReading(); return; }
   if (pinnedBottom) {
     restoringChatScroll = true;
     list.scrollTop = list.scrollHeight;
     requestAnimationFrame(() => { restoringChatScroll = false; });
   } else if (readingAnchor) restoreChatPosition(readingAnchor);
-}).observe(itemsEl);
+});
+for (const el of [itemsEl, $('older'), $('historyStatus'), $('cachedMore')]) chatSizeObserver.observe(el);
 document.addEventListener('selectionchange', () => {
   if (deferredRender && !userSelecting()) { deferredRender = false; if (lastChat) renderChat(lastChat); }
 });
@@ -333,7 +395,7 @@ function paintWorkdir(wd) {
   const b = $('pickDir');
   b.hidden = !wd;
   if (!wd) return;
-  b.textContent = `📁 ${wd.name}${wd.extra ? ' ' + wd.extra : ''} ▾`;
+  b.textContent = `📁 ${wd.name}${wd.extra ? ' ' + wd.extra : ''}`;
   b.title = wd.editable ? '更换工作目录' : '这个会话的工作目录';
   if (wantDir && wd.editable) { wantDir = false; send({ t: 'workdir' }); }
 }
@@ -355,11 +417,20 @@ function pruneEchoes(chat) {
   if (!pendingEchoes.length) return;
   const humans = (chat?.items || []).filter(it => it.k === 'human');
   const queued = (chat?.queued || []).map(q => (q.t || '').trim());
+  const queuedCount = Math.max(queued.length, chat?.queuedCount || 0);
   pendingEchoes = pendingEchoes.filter(p => {
-    if (Date.now() - p.at > 60000) return false;
+    // A send that vanished with a dead socket would otherwise spin "发送中…" forever.
+    if (Date.now() - p.at > (p.confirmed ? 60000 : 120000)) return false;
     if (p.sel !== viewSel) return true;
-    if (humans.filter(it => echoTextMatches(it, p.text)).length > p.before) return false;
+    const matches = humans.filter(it => echoTextMatches(it, p.text)).length;
+    if (matches > p.before) return false;
+    // Once the send is acknowledged, a human item stamped after the click is enough: the extracted
+    // text can differ from the typed text (mentions, attachments), which would leave the echo forever.
+    if (p.confirmed && humans.some(it => it.sentAt && it.sentAt >= p.at - 2000)) return false;
     if (p.kind === 'queue' && queued.some(t => echoTextMatches({ t }, p.text))) return false;
+    // Queue row text is rendered (markdown, collapsed whitespace) and may never equal the
+    // typed text; once confirmed, any non-empty queue already contains the echo.
+    if (p.kind === 'queue' && p.confirmed && queuedCount > 0) return false;
     return true;
   });
 }
@@ -367,22 +438,50 @@ function pendingEchoEls() {
   return pendingEchoes.filter(p => p.kind === 'chat' && p.sel === viewSel).map(p => {
     const el = document.createElement('div');
     el.className = 'msg human pending';
-    el.innerHTML = `<div class="humanContent"><div class="bubble">${esc(p.text)}</div><div class="messageMeta">发送中…</div></div>`;
+    el.innerHTML = `<div class="humanContent"><div class="bubble">${esc(p.text)}</div><div class="messageMeta">${I18N.tr(p.confirmed ? '已发送' : '发送中…')}</div></div>`;
     return el;
   });
 }
+const executionRecordsShown = () => store.get('show-execution-' + currentApp) === '1';
+function executionRecord(it) {
+  return it.k === 'tool' && (it.execution || ['command', 'read', 'search', 'explore'].includes(it.kind)
+    || String(it.i).includes(':exec:'));
+}
+function visibleChatItems(items, busy) {
+  const shown = executionRecordsShown();
+  const latestTurn = busy ? Math.max(0, items.findLastIndex(it => it.k === 'human')) : items.length;
+  return items.filter((it, n) => {
+    if (!executionRecord(it)) return !(it.k === 'tool' && it.done);
+    const attention = it.keep || it.b?.some(b => /^(?:run(?! in background)|allow|approve|reject|deny|retry|confirm|continue|accept)\b|^(?:运行|允许|批准|拒绝|重试|确认|继续|接受)/i.test(b))
+      || /(?:^|\n)\s*(?:error\b|failed\b|permission denied\b|(?:(?:process|command) )?exit(?:ed)?(?: with)? code[: ]+[1-9]\d*|错误|失败|拒绝)/i.test([it.t, it.output].filter(Boolean).join('\n'));
+    return shown || attention || (!it.done && n >= latestTurn);
+  });
+}
+function toggleExecutionRecords() {
+  store.set('show-execution-' + currentApp, executionRecordsShown() ? '0' : '1');
+  renderChat(lastChat, chatStale);
+  showMainMenu();
+}
 function renderChat(chat, stale, loading = false) {
+  if (chat) reconcileSent(chat);
   chat = withMessageTimes(chat);
   pruneEchoes(chat);
   updateGenerationTime(chat, stale);
   chatStale = !!stale;
   if (chat?.items?.some(it => it.k === 'human')) $('sessionNotice').hidden = true;
+  rememberInputHistory(chat);
   const previous = lastChat;
+  if (chat && previous?.thread === chat.thread && (previous.model !== chat.model || previous.effort !== chat.effort)) {
+    menuCache.delete(menuCacheKey('model'));
+    menuCache.delete(menuCacheKey('effort'));
+  }
   if (!chat || previous?.thread !== chat.thread) {
-    historyRequest = null; historyRendering = false; historyExpanded = false; historyArmed = false; historyAtEnd = false; readingAnchor = null;
+    resetTurnNav();
+    historyRequest = null; historyRendering = false; historyExpanded = false; historyArmed = false; historyAtEnd = false; readingAnchor = null; pendingHistoryStatus = null;
     $('older').disabled = false;
     $('historyStatus').hidden = true;
   }
+  if (currentApp === 'codex' && chat?.earlier === true) historyAtEnd = false;
   if (chat && previous?.thread === chat.thread && historyExpanded && currentApp !== 'devin') {
     const rows = historyRequest ? [...chat.items, ...previous.items] : [...previous.items, ...chat.items];
     const updates = new Map(chat.items.map(it => [it.i, it]));
@@ -399,30 +498,29 @@ function renderChat(chat, stale, loading = false) {
     renderQuestions(chat.readonly && !chat.questions?.codex ? null : chat.questions);
     return;
   }
-  const followBottom = !historyRequest && !historyRendering && nearBottom();
+  const followBottom = !historyRequest && !historyRendering && followingChat();
   const savedAnchor = followBottom ? null : captureChatAnchor();
   lastChat = chat; updateTitle();
   paintGenerationTime();
   paintWorkdir(chat?.workdir);
   if (chat && 'context' in chat) renderContext(chat.context);
   const imageOnly = chat?.imagePreview && !chat.items.length;
-  $('empty').hidden = !!chat && !imageOnly;
-  $('empty').firstChild.textContent = I18N.tr(imageOnly ? '电脑端正在查看图片，暂无已同步的对话。关闭图片预览后会自动恢复。' : loading ? '正在加载对话…' : '没找到聊天面板。');
-  $('emptyHint').hidden = loading || imageOnly;
+  $('empty').hidden = !!chat && !imageOnly && !chat.loginRequired;
+  $('empty').firstChild.textContent = I18N.tr(chat?.loginRequired ? '项目窗口已打开，请在电脑端登录此窗口的 Codex，登录后重新选择会话' : imageOnly ? '电脑端正在查看图片，暂无已同步的对话。关闭图片预览后会自动恢复。' : loading ? '正在加载对话…' : '没找到聊天面板。');
+  $('emptyHint').hidden = loading || imageOnly || !!chat?.loginRequired;
   $('older').hidden = !chat || chat.earlier === false;
-  $('pickMode').hidden = currentApp === 'devin' || !chat?.mode;
-  $('pickModel').hidden = false;
-  if (chat?.mode) { $('pickMode').textContent = (chat.mode === 'Bypass Permissions' ? '⚠绕过' : chat.mode) + ' ▾'; $('pickMode').title = chat.mode; }
+  $('pickMode').hidden = currentApp === 'devin' || currentApp === 'cursor' || !chat?.mode;
+  $('pickModel').hidden = !supportsCapability('model');
+  if (chat?.mode) { $('pickMode').textContent = chat.mode === 'Bypass Permissions' ? '⚠绕过' : chat.mode; $('pickMode').title = chat.mode; }
   $('pickMode').classList.toggle('bypass', chat?.mode === 'Bypass Permissions');
-  const fusionLabel = chat?.model === 'Fusion' && chat.fusion ? `Fusion · ${fusionShort(chat.fusion.lead)} / ${fusionShort(chat.fusion.sidekick)}` : '';
-  const mdl = fusionLabel || chat?.model || '模型';
+  const mdl = chat?.model || '模型';
   const effLabel = chat?.effort && chat.effort !== 'Effort' ? String(chat.effort).replace(/^([a-z])/, c => c.toUpperCase()) : '';
-  const effSuffix = !fusionLabel && chat?.model !== 'Fusion' && effLabel && !mdl.toLowerCase().includes(effLabel.toLowerCase()) ? ` · ${effLabel}` : '';
-  $('pickModel').textContent = mdl + effSuffix + ' ▾';
+  const effSuffix = chat?.model !== 'Fusion' && effLabel && !mdl.toLowerCase().includes(effLabel.toLowerCase()) ? ` · ${effLabel}` : '';
+  $('pickModel').textContent = mdl + effSuffix;
   $('pickModel').title = chat?.fusion ? `${chat.fusion.lead} · ${chat.fusion.effort} · ${chat.fusion.sidekick}${chat.fusion.fast ? ' · Fast' : ''}` : (chat?.model || '更换模型');
   const permName = PERM_LABEL[chat?.permission]?.[0];
   $('pickPerm').hidden = true;
-  if (chat?.permission) { $('pickPerm').textContent = ({ 'Ask for approval': '询问', 'Approve for me': '替我审核', 'Full access': '完全批准' }[chat.permission] || permName || chat.permission) + ' ▾'; $('pickPerm').title = permName || chat.permission; }
+  if (chat?.permission) { $('pickPerm').textContent = ({ 'Ask for approval': '询问', 'Approve for me': '替我审核', 'Full access': '完全批准' }[chat.permission] || permName || chat.permission); $('pickPerm').title = permName || chat.permission; }
   const codexBar = currentApp === 'codex' ? chat?.codex : null;
   $('add').hidden = false;
   $('pickPlan').hidden = true;
@@ -434,7 +532,7 @@ function renderChat(chat, stale, loading = false) {
     $('pickIde').title = file ? `${file.label}${file.range ? ' ' + file.range : ''}` : 'IDE 上下文';
   }
   $('pickRun').hidden = true;
-  if (codexBar?.run) $('pickRun').textContent = codexBar.run + ' ▾';
+  if (codexBar?.run) $('pickRun').textContent = codexBar.run;
   $('pickChat').hidden = true;
   paintFusion(currentApp === 'fusion' ? chat?.fusion : null);
   chatBusy = !!chat?.busy;
@@ -462,9 +560,10 @@ function renderChat(chat, stale, loading = false) {
   $('cachedMore').hidden = !V.older;
   $('cachedMore').textContent = `↑ 显示更早的本地记录（${V.older} 条）`;
   const stick = followBottom || sessionChanged;
+  const visibleItems = visibleChatItems(V.items, chat.busy);
   // Anchor on the first visible item so loading older messages doesn't jump.
   let anchor = savedAnchor;
-  if (anchor && !V.items.some(it => String(it.i) === anchor.id && !(it.k === 'tool' && it.done))) anchor = null;
+  if (anchor && !visibleItems.some(it => String(it.i) === anchor.id)) anchor = null;
   if (!stick && !anchor) {
     const top = list.getBoundingClientRect().top;
     let lo = 0, hi = itemsEl.children.length;
@@ -473,7 +572,7 @@ function renderChat(chat, stale, loading = false) {
       if (itemsEl.children[mid].getBoundingClientRect().bottom > top) hi = mid;
       else lo = mid + 1;
     }
-    const retained = new Set(V.items.filter(it => !(it.k === 'tool' && it.done)).map(it => String(it.i)));
+    const retained = new Set(visibleItems.map(it => String(it.i)));
     for (let n = lo; n < itemsEl.children.length; n++) {
       const el = itemsEl.children[n];
       if (retained.has(el.dataset.i)) { anchor = { id: el.dataset.i, top: el.getBoundingClientRect().top - top }; break; }
@@ -483,7 +582,6 @@ function renderChat(chat, stale, loading = false) {
       if (retained.has(el.dataset.i)) { anchor = { id: el.dataset.i, top: el.getBoundingClientRect().top - top }; break; }
     }
   }
-  const visibleItems = V.items.filter(it => !(it.k === 'tool' && it.done));
   const els = visibleItems.map(it => {
     const key = JSON.stringify(it);
     const hit = cache.get(it.i);
@@ -494,6 +592,10 @@ function renderChat(chat, stale, loading = false) {
       return hit.el;
     }
     const el = renderItem(it);
+    if (it.k === 'tool' && it.kind === 'command' && hit?.el.classList.contains('toolrow') && patchToolRow(hit.el, el)) {
+      cache.set(it.i, { key, el: hit.el });
+      return hit.el;
+    }
     if (it.k === 'tool' && hit?.el.classList.contains('toolrow')) {
       const open = hit.el.classList.contains('open');
       el.classList.toggle('open', open);
@@ -538,7 +640,7 @@ function renderChat(chat, stale, loading = false) {
   $('taskChip').hidden = !latestTasks || (latestTasks.done >= latestTasks.total && !chat.busy);
   if (latestTasks) $('taskChip').innerHTML = `<span>${I18N.tr('任务')}</span> ${latestTasks.done}/${latestTasks.total}`;
   if (sheetKind === 'tasks') showTasks();
-  const live = new Set(visibleItems.map(it => it.i));
+  const live = new Set(V.items.map(it => it.i));
   for (const k of cache.keys()) if (!live.has(k)) { thoughtObserver.unobserve(cache.get(k).el); cache.delete(k); }
 
   // A cached render is display-only: no action buttons, questions or queue actions until the fresh chat arrives.
@@ -547,15 +649,17 @@ function renderChat(chat, stale, loading = false) {
   renderQueue(chatStale ? false : chat.busy, chatStale ? [] : (chat.queued || []), chat.subagents || [], chat.readonly, chat.changed, chat.queuedCount);
   renderQuestions(chatStale || (chat.readonly && !chat.questions?.codex) ? null : chat.questions);
 
+  paintHistoryStatus();
   restoreChatPosition(anchor, stick);
   historyRendering = false;
   if (!stick && previous && JSON.stringify(previous.items) !== JSON.stringify(chat.items)) $('toBottom').textContent = '↓ 有新消息';
   updateToBottom();
   noteSwitch(chat);
   if (SC.jump && SC.items.has(SC.jump)) { const j = SC.jump; SC.jump = null; scJump(j); }
+  completeTurnNavigation();
 }
 
-let subsOpen = false;
+let subsOpen = false, queueOpen = store.get('queue-open') !== '0';
 // Newest Devin task list (highest acp index); the chip above the chat and its sheet show it.
 let latestTasks = null;
 function showTasks() {
@@ -566,13 +670,15 @@ itemsEl.addEventListener('click', e => { const b = e.target.closest('[data-codex
 $('taskChip').onclick = () => showTasks();
 itemsEl.addEventListener('toggle', e => { const id = e.target.dataset.task; if (id) e.target.open ? taskOpen.add(id) : taskOpen.delete(id); }, true);
 $('qnBar').addEventListener('click', e => {
+  const compose = e.target.closest('[data-question-compose]');
+  if (compose) { setQuestionCompose(compose.dataset.questionCompose); text.focus(); return; }
   const b = e.target.closest('[data-action][data-request]');
   if (b) {
     const id = b.dataset.request, n = Number(b.dataset.action);
     const request = qnState?.requests?.find(r => r.id === id);
     const fields = !id.startsWith('async:') || n === request.buttons.length - 1
       ? [...$('qnBar').querySelectorAll('[data-field]')].filter(el => el.dataset.request === id).map(el => ({ n: Number(el.dataset.field), value: el.value })) : [];
-    sendQuestion({ t: 'codexRequest', id, n, fields });
+    sendQuestion({ t: 'codexRequest', id, n, fields, ...(id.startsWith('async:') && n < request.buttons.length - 2 ? { advance: true } : {}) });
   }
 });
 // The Agent's ask-question tool: a card with the questions, options, a free-text answer and submit / skip.
@@ -593,13 +699,56 @@ function sendQuestion(message) {
   status('正在提交回答…');
   send({ ...message, requestId });
 }
+function setQuestionCompose(id) {
+  if (questionCompose?.id === id && questionCompose.sel === viewSel || !questionCompose && !id) return;
+  if (mode !== 'chat') { questionCompose = id ? { id, sel: viewSel } : null; updateAppText(); updateSendMode(); return; }
+  saveDraft();
+  const carry = !questionCompose && mode === 'chat' ? text.value : '';
+  questionCompose = id ? { id, sel: viewSel } : null;
+  restoreDraft();
+  if (id && !drafts.has(activeDraft)) {
+    text.value = qnDrafts.get(`${id}|0`) ?? qnState?.requests?.find(r => r.id === id)?.fields[0]?.value ?? '';
+    if (!text.value) text.value = carry;
+    syncQuestionDraft(text.value);
+    autosize(); saveDraft();
+  }
+  updateAppText();
+  updateSendMode();
+}
+function syncQuestionDraft(value) {
+  if (mode !== 'chat' || questionCompose?.sel !== viewSel) return;
+  qnDrafts.set(`${questionCompose.id}|0`, value);
+  const field = [...$('qnBar').querySelectorAll('[data-field="0"]')].find(el => el.dataset.request === questionCompose.id);
+  if (field) {
+    field.value = value;
+    const request = qnState?.requests?.find(r => r.id === questionCompose.id);
+    const submit = [...$('qnBar').querySelectorAll('[data-action]')].find(el => el.dataset.request === questionCompose.id && Number(el.dataset.action) === request.buttons.length - 1);
+    if (submit) submit.disabled = !!qnPending || request.buttons.every(b => b.disabled) || !value.trim();
+  }
+}
+function submitQuestionCompose() {
+  const request = qnState?.requests?.find(r => r.id === questionCompose?.id);
+  if (!request) return status('当前问题已结束，请确认后再发送', false);
+  if (!text.value.trim()) return;
+  saveDraft();
+  sendQuestion({ t: 'codexRequest', id: request.id, n: request.buttons.length - 1, fields: [{ n: 0, value: text.value }] });
+}
 function finishQuestion(m) {
   if (!qnPending || m.requestId !== qnPending.requestId) return;
   const pending = qnPending;
   qnPending = null;
   if (pending.sel !== viewSel) return;
   if (m.ok && pending.message.id) {
+    const answerKey = [currentComputer()?.id || '', viewSel, 'chat', pending.message.id].join('|');
+    drafts.delete(answerKey); draftMentions.delete(answerKey);
+    if (pending.message.id.startsWith('async:') && (pending.message.advance || pending.message.n === (qnState?.requests?.find(r => r.id === pending.message.id)?.buttons.length || 0) - 1)) {
+      qnState = { ...qnState, requests: qnState.requests.filter(r => r.id !== pending.message.id) };
+    }
     for (const key of qnDrafts.keys()) if (key.startsWith(pending.message.id + '|')) qnDrafts.delete(key);
+    if (questionCompose?.id === pending.message.id) {
+      if (mode === 'chat') text.value = '';
+      setQuestionCompose(null);
+    }
   }
   qnSig = '';
   renderQuestions(qnState);
@@ -609,6 +758,8 @@ function renderQuestions(qs) {
   const bar = $('qnBar');
   if (qnView !== viewSel) { qnView = viewSel; qnSig = ''; qnPending = null; qnDrafts.clear(); }
   qnState = qs;
+  const answers = qs?.codex ? qs.requests.filter(r => r.id.startsWith('async:')) : [];
+  setQuestionCompose(answers.find(r => r.id === questionCompose?.id && questionCompose.sel === viewSel)?.id || answers[0]?.id || null);
   bar.classList.toggle('codex', !!qs?.codex);
   const sig = JSON.stringify(qs);
   if (sig === qnSig) return;
@@ -617,10 +768,15 @@ function renderQuestions(qs) {
     const focused = bar.contains(document.activeElement) ? document.activeElement : null;
     const focusKey = focused?.matches('[data-field]') ? questionFieldKey(focused) : null;
     const selection = focusKey ? [focused.selectionStart, focused.selectionEnd] : null;
-    bar.innerHTML = qs.requests.map(r => `<div class="qnQ">${esc(r.text)}</div>`
-      + r.fields.map((f, n) => `<label class="qnFree">${esc(f.label)}${f.options ? `<select data-request="${esc(r.id)}" data-field="${n}">${f.options.map(o => `<option value="${esc(o.value)}" ${o.value === f.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>` : `<input data-request="${esc(r.id)}" data-field="${n}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(f.value)}">`}</label>`).join('')
+    const expanded = new Set([...bar.querySelectorAll('details[open]')].map(el => el.dataset.question));
+    bar.innerHTML = `<div class="qnHead">Codex 等待你${qs.requests.some(r => r.id.startsWith('approval:')) ? '审批' : '回答'}<span class="qnCount">${qs.requests.length} 个请求</span></div>` + qs.requests.map(r => {
+      const lines = r.text.trim().split('\n'), heading = lines.shift();
+      const remaining = lines.join('\n').trim();
+      return `<section class="qnRequest"><div class="qnQ">${esc(heading)}</div>`
+      + (remaining ? `<details class="qnDetails" data-question="${esc(r.id)}" ${expanded.has(r.id) ? 'open' : ''}><summary>展开问题详情</summary>${esc(remaining)}</details>` : '')
       + (r.id.startsWith('async:') ? `<div class="qnOpts">${r.buttons.slice(0, -2).map((b, n) => `<button class="qnOpt ${b.selected ? 'on' : ''}" data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div>` : '')
-      + `<div class="qnAct">${r.buttons.map((b, n) => r.id.startsWith('async:') && n < r.buttons.length - 2 ? '' : `<button data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div>`).join('');
+      + r.fields.map((f, n) => `<label class="qnFree">${esc(f.label)}${f.options ? `<select data-request="${esc(r.id)}" data-field="${n}">${f.options.map(o => `<option value="${esc(o.value)}" ${o.value === f.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>` : `<input data-request="${esc(r.id)}" data-field="${n}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(f.value)}">`}</label>`).join('')
+      + `<div class="qnAct">${r.id.startsWith('async:') ? `<button data-question-compose="${esc(r.id)}">在对话框回答</button>` : ''}${r.buttons.map((b, n) => r.id.startsWith('async:') && n < r.buttons.length - 2 ? '' : `<button data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div></section>`; }).join('');
     bar.classList.toggle('show', qs.requests.length > 0);
     bar.querySelectorAll('[data-field]').forEach(el => {
       const key = questionFieldKey(el);
@@ -628,11 +784,16 @@ function renderQuestions(qs) {
       el.oninput = () => {
         qnDrafts.set(key, el.value);
         const r = qnState.requests.find(r => r.id === el.dataset.request);
+        if (r.id.startsWith('async:') && el.dataset.field === '0' && mode === 'chat' && document.activeElement === el) {
+          setQuestionCompose(r.id);
+          text.value = el.value; autosize(); saveDraft();
+        }
         if (r.id.startsWith('async:') && !r.buttons.every(b => b.disabled) && !qnPending) {
           const submit = [...bar.querySelectorAll('[data-action]')].find(b => b.dataset.request === r.id && Number(b.dataset.action) === r.buttons.length - 1);
           submit.disabled = !el.value.trim();
         }
       };
+      if (el.dataset.request.startsWith('async:') && el.dataset.field === '0') el.onfocus = () => setQuestionCompose(el.dataset.request);
       el.onchange = () => { if (!el.dataset.request.startsWith('async:')) send({ t: 'codexRequest', id: el.dataset.request, field: Number(el.dataset.field), value: el.value }); };
       if (qnDrafts.has(key)) el.oninput();
       if (key === focusKey && !qnPending) {
@@ -641,12 +802,13 @@ function renderQuestions(qs) {
       }
     });
     questionBusy();
+    if (document.body.classList.contains('kb')) fitViewport();
     return;
   }
   if (!qs?.list?.length) { bar.innerHTML = ''; bar.classList.remove('show'); return; }
   if (qs.devin) {
     const q = qs.list[0], pg = qs.pager;
-    bar.innerHTML = `<div class="qnHead">❓ Devin 在问你${pg ? `（${pg.cur}/${pg.total}）` : ''}`
+    bar.innerHTML = `<div class="qnHead">Devin 在问你${pg ? `（${pg.cur}/${pg.total}）` : ''}`
       + (pg && pg.total > 1 ? `<span class="qnPg"><button data-qpart="prev" ${qs.canPrev ? '' : 'disabled'}>‹</button><button data-qpart="next" ${qs.canNext ? '' : 'disabled'}>›</button></span>` : '') + '</div>'
       + `<div class="qnQ">${esc(q.text)}</div><div class="qnOpts">`
       + q.options.map((o, oi) => `<button class="qnOpt ${o.sel ? 'on' : ''}" data-qi="0" data-oi="${oi}"><b>${q.multi ? (o.sel ? '☑' : '☐') : String.fromCharCode(65 + oi)}</b><span>${esc(o.label)}${o.desc ? `<small>${esc(o.desc)}</small>` : ''}</span></button>`).join('')
@@ -656,7 +818,7 @@ function renderQuestions(qs) {
     questionBusy();
     return;
   }
-  bar.innerHTML = `<div class="qnHead">❓ Agent 在问你${qs.list.length > 1 ? `（${qs.list.length} 个问题）` : ''}</div>`
+  bar.innerHTML = `<div class="qnHead">Agent 在问你${qs.list.length > 1 ? `（${qs.list.length} 个问题）` : ''}</div>`
     + qs.list.map((q, qi) => `<div class="qnQ">${qs.list.length > 1 ? `${qi + 1}. ` : ''}${esc(q.text)}</div><div class="qnOpts">`
       + q.options.map((o, oi) => {
         const letter = String.fromCharCode(65 + oi);
@@ -720,10 +882,12 @@ function renderQueue(busy, queued, subs = [], readonly = false, changed = 0, qCo
   const pending = pendingEchoes.filter(p => p.kind === 'queue' && p.sel === viewSel);
   const n = Math.max(queued.length, devin ? qCount || 0 : 0) + pending.length;
   if (n) {
-    html += `<div class="qh">排队中 ${n} 条${devin ? ' ' + ibtn('trash', '清空', 'data-a="clear" data-q=""', 'del') : ''}</div>`;
+    html += `<div class="qhRow"><button class="qh fold" data-qfold aria-expanded="${queueOpen}">${queueOpen ? '▾' : '▸'} <span>排队中 ${n} 条</span></button>${devin ? ibtn('trash', '清空', 'data-a="clear" data-q=""', 'del') : ''}</div>`;
+  }
+  if (n && queueOpen) {
     html += pending.map(p => `<div class="q pending"><span class="qt">${esc(p.text)}</span><span class="sub">发送中…</span></div>`).join('');
     html += queued.map(q => `<div class="q"><span class="qt">${esc(q.t || '(空)')}</span>`
-      + ibtn('edit', devin ? '从队列取出，放回输入框' : '修改', `data-q="${esc(q.id)}" data-a="edit"`)
+      + (supportsCapability('queueEdit') ? ibtn('edit', devin ? '从队列取出，放回输入框' : '修改', `data-q="${esc(q.id)}" data-a="edit"`) : '')
       + ibtn('enter', '打断当前这一轮，立刻发送', `data-q="${esc(q.id)}" data-a="send"`)
       + ibtn('x', '删除', `data-q="${esc(q.id)}" data-a="remove"`, 'del') + '</div>').join('');
     if (devin && !queued.length) html += `<div class="q"><span class="qt">内容读不到，只显示数量</span></div>`;
@@ -758,6 +922,7 @@ $('queueBar').onclick = async e => {
     return toggleChangeNotice();
   }
   if ('changes' in b.dataset) { status('读取改动的文件…'); return send({ t: 'changes' }); }
+  if ('qfold' in b.dataset) { queueOpen = !queueOpen; store.set('queue-open', queueOpen ? null : '0'); return renderQueue(lastChat?.busy, lastChat?.queued || [], lastChat?.subagents || [], lastChat?.readonly, lastChat?.changed, lastChat?.queuedCount); }
   if ('fold' in b.dataset) { subsOpen = !subsOpen; return renderQueue(lastChat?.busy, lastChat?.queued || [], lastChat?.subagents || [], lastChat?.readonly, lastChat?.changed, lastChat?.queuedCount); }
   if ('main' in b.dataset) { send({ t: 'mainChat' }); status('返回主对话…'); return; }
   if (b.dataset.sub) {
@@ -783,6 +948,165 @@ $('queueBar').onclick = async e => {
 function updateToBottom() {
   if (nearBottom()) $('toBottom').textContent = '↓ 最新';
   $('toBottom').style.display = nearBottom() ? 'none' : 'block';
+  updateTurnNav();
+}
+function updateTurnNav() {
+  const track = $('turnNavTrack'), nav = $('turnNav');
+  track.hidden = !itemsEl.querySelector(':scope > .human[data-i]') || list.scrollHeight <= list.clientHeight;
+  if (!track.hidden) {
+    const travel = track.clientHeight - nav.offsetHeight;
+    track.hidden = travel < 0;
+    if (!track.hidden) {
+      const progress = turnNavPointer?.dragging ? turnNavPointer.progress : list.scrollTop / (list.scrollHeight - list.clientHeight);
+      nav.style.top = Math.max(0, Math.min(1, progress)) * travel + 'px';
+    }
+  }
+}
+const turnNavSizeObserver = new ResizeObserver(updateTurnNav);
+for (const el of [$('listWrap'), itemsEl]) turnNavSizeObserver.observe(el);
+function resetTurnNav() {
+  clearTimeout(turnNavTimer);
+  if (turnNavPointer?.dragging) { chatTouching = chatScrolling = false; clearTimeout(scrollIdle); }
+  turnNavPointer = null; turnNavSkipClick = false;
+  turnNavHeld = turnNavUser = false;
+  turnNavCursor = turnNavPending = null;
+  $('turnNav').classList.remove('show');
+}
+function showTurnNav() {
+  if (!itemsEl.querySelector(':scope > .human[data-i]')) return;
+  $('turnNav').classList.add('show');
+  clearTimeout(turnNavTimer);
+  if (!turnNavHeld) turnNavTimer = setTimeout(() => {
+    $('turnNav').classList.remove('show');
+    turnNavUser = false;
+  }, 1500);
+}
+function turnNavGesture() {
+  turnNavCursor = turnNavPending = null;
+  turnNavUser = true;
+  showTurnNav();
+}
+function conversationTurns() {
+  return [...(SC.key ? SC.items.values() : lastChat?.items || [])]
+    .filter(it => it.k === 'human')
+    .sort((a, b) => (a.order ?? acpNum(a.i)) - (b.order ?? acpNum(b.i)));
+}
+function jumpToTurn(id) {
+  clearTimeout(scrollIdle);
+  chatScrolling = false;
+  let el = itemsEl.querySelector(`[data-i="${CSS.escape(String(id))}"]`);
+  if (!el || deferredScrollRender) {
+    if (!el) {
+      const all = [...SC.items.values()].sort((a, b) => (a.order ?? acpNum(a.i)) - (b.order ?? acpNum(b.i)));
+      SC.show = Math.max(SC.show, all.length - all.findIndex(it => it.i === id));
+    }
+    deferredScrollRender = false;
+    historyRendering = true;
+    renderChat(lastChat, chatStale);
+    el = itemsEl.querySelector(`[data-i="${CSS.escape(String(id))}"]`);
+  }
+  if (!el) return;
+  historyArmed = false;
+  restoreChatPosition({ id: String(id), top: 8 });
+  lastScrollTop = list.scrollTop;
+  turnNavCursor = { id, sel: viewSel, thread: lastChat.thread };
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1800);
+  updateToBottom();
+  showTurnNav();
+}
+function completeTurnNavigation() {
+  if (!turnNavPending) return;
+  const pending = turnNavPending;
+  if (pending.sel !== viewSel || pending.thread !== lastChat?.thread) { turnNavPending = null; return; }
+  const turns = conversationTurns(), pos = turns.findIndex(it => it.i === pending.before);
+  if (pos > 0) { turnNavPending = null; jumpToTurn(turns[pos - 1].i); }
+  else if (!historyRequest) turnNavPending = null;
+}
+function navigateTurn(direction) {
+  if (!lastChat || chatTouching) return;
+  const turns = conversationTurns();
+  let target;
+  if (turnNavCursor?.sel === viewSel && turnNavCursor.thread === lastChat.thread) {
+    target = turns[turns.findIndex(it => it.i === turnNavCursor.id) + direction];
+  } else {
+    const top = list.getBoundingClientRect().top + 8;
+    const humans = [...itemsEl.querySelectorAll(':scope > .human[data-i]')];
+    const el = direction < 0 ? humans.findLast(el => el.getBoundingClientRect().top < top - 2)
+      : humans.find(el => el.getBoundingClientRect().top > top + 2);
+    if (el) target = turns.find(it => String(it.i) === el.dataset.i);
+    else if (direction < 0 && humans.length) target = turns[turns.findIndex(it => String(it.i) === humans[0].dataset.i) - 1];
+  }
+  if (target) { turnNavPending = null; jumpToTurn(target.i); }
+  else if (direction < 0 && turns.length) {
+    turnNavPending = { sel: viewSel, thread: lastChat.thread, before: turns[0].i };
+    if (historyRequest) return;
+    clearTimeout(scrollIdle); chatScrolling = false;
+    loadOlderMessages();
+    if (!historyRequest && !deferredScrollRender) completeTurnNavigation();
+  }
+}
+$('previousTurn').onclick = () => navigateTurn(-1);
+$('nextTurn').onclick = () => navigateTurn(1);
+$('toBottom').addEventListener('click', resetTurnNav);
+$('turnNav').addEventListener('pointerdown', e => {
+  if (e.button !== 0 || turnNavPointer) return;
+  e.preventDefault();
+  const nav = $('turnNav');
+  turnNavSkipClick = false;
+  turnNavPointer = { id: e.pointerId, y: e.clientY, top: nav.offsetTop,
+    travel: $('turnNavTrack').clientHeight - nav.offsetHeight,
+    opened: nav.classList.contains('show') || nav.matches(':focus-within'), dragging: false };
+  e.target.setPointerCapture(e.pointerId);
+  turnNavHeld = true; showTurnNav();
+});
+$('turnNav').addEventListener('pointermove', e => {
+  const pointer = turnNavPointer;
+  if (!pointer || pointer.id !== e.pointerId) return;
+  const dy = e.clientY - pointer.y;
+  if (!pointer.dragging && Math.abs(dy) < 6) return;
+  e.preventDefault();
+  if (!pointer.dragging) {
+    pointer.dragging = true;
+    turnNavGesture();
+    chatTouching = chatScrolling = true;
+    pinnedBottom = false;
+    clearTimeout(scrollIdle);
+  }
+  pointer.progress = Math.max(0, Math.min(1, (pointer.top + dy) / pointer.travel));
+  list.scrollTop = pointer.progress * (list.scrollHeight - list.clientHeight);
+  readingAnchor = captureChatAnchor();
+  settleChatScroll();
+});
+for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) $('turnNav').addEventListener(event, e => {
+  const pointer = turnNavPointer;
+  if (!pointer || pointer.id !== e.pointerId) return;
+  turnNavSkipClick = event === 'pointerup' && (pointer.dragging || !pointer.opened);
+  turnNavPointer = null; turnNavHeld = false;
+  if (pointer.dragging) { chatTouching = false; settleChatScroll(); }
+  updateTurnNav(); showTurnNav();
+});
+$('turnNav').addEventListener('click', e => {
+  if (turnNavSkipClick) { e.preventDefault(); e.stopImmediatePropagation(); turnNavSkipClick = false; }
+}, true);
+$('turnNav').addEventListener('touchstart', e => {
+  e.stopPropagation();
+}, { passive: true });
+function paintHistoryStatus() {
+  if (pendingHistoryStatus === null) return;
+  $('older').disabled = !!historyRequest;
+  if (historyAtEnd) $('older').hidden = true;
+  $('historyStatus').hidden = false;
+  $('historyStatus').textContent = pendingHistoryStatus;
+  pendingHistoryStatus = null;
+}
+function showHistoryStatus(message) {
+  pendingHistoryStatus = I18N.tr(message);
+  // A pending chat frame applies the notice and older rows under the same anchor.
+  if (chatScrolling || chatTouching || chatFrame) return;
+  const anchor = captureChatAnchor();
+  paintHistoryStatus();
+  restoreChatPosition(anchor);
 }
 function loadOlderMessages() {
   if (!lastChat || historyRequest || chatScrolling || chatTouching) return;
@@ -802,35 +1126,26 @@ function requestOlderRemote() {
   if (!lastChat || historyRequest) return;
   historyArmed = false;
   if (historyAtEnd || $('older').hidden) {
-    $('historyStatus').hidden = false;
-    $('historyStatus').textContent = I18N.tr('已到最早消息');
+    showHistoryStatus('已到最早消息');
     return;
   }
   if (currentApp === 'codex' && lastChat.busy) {
-    $('historyStatus').hidden = false;
-    $('historyStatus').textContent = I18N.tr('生成中，稍后上滑加载历史');
+    showHistoryStatus('生成中，稍后上滑加载历史');
     return;
   }
   historyRequest = { id: String(++historySerial), sel: viewSel };
   historyRendering = true;
   historyExpanded = true;
-  const anchor = captureChatAnchor();
-  $('older').disabled = true;
-  $('historyStatus').hidden = false;
-  $('historyStatus').textContent = I18N.tr('正在加载更早的消息…');
-  if (!chatScrolling && !chatTouching) restoreChatPosition(anchor);
+  showHistoryStatus('正在加载更早的消息…');
   send({ t: 'scrollChat', dy: -900, automatic: true, history: true, requestId: historyRequest.id });
 }
 function finishHistory(m) {
   if (!historyRequest || m.requestId !== historyRequest.id || m.sel !== historyRequest.sel) return;
-  const anchor = captureChatAnchor();
   historyRequest = null;
-  $('older').disabled = false;
-  $('historyStatus').hidden = false;
-  $('historyStatus').textContent = I18N.tr(m.error || (m.blocked ? '生成中，稍后上滑加载历史' : m.earlier === false && $('cachedMore').hidden ? '已到最早消息' : '继续上滑可加载更早的消息'));
-  if (m.earlier === false) { historyAtEnd = true; $('older').hidden = true; }
-  if (!chatScrolling && !chatTouching) restoreChatPosition(anchor);
+  if (m.earlier === false) historyAtEnd = true;
+  showHistoryStatus(m.error || (m.blocked ? '生成中，稍后上滑加载历史' : m.earlier === false && $('cachedMore').hidden ? '已到最早消息' : '继续上滑可加载更早的消息'));
   if (!deferredScrollRender) historyRendering = false;
+  if (!deferredScrollRender && !chatFrame) completeTurnNavigation();
   maybePrefetchOlder();
 }
 const prefetchZone = () => Math.max(600, list.clientHeight * 1.5);
@@ -846,26 +1161,38 @@ function settleChatScroll() {
   if (top < lastScrollTop) { historyArmed = true; pinnedBottom = false; }
   lastScrollTop = top;
   if (pinnedBottom && !nearBottom()) pinnedBottom = false;
+  else if (!pinnedBottom && atBottom()) pinnedBottom = true;
   chatScrolling = true;
   clearTimeout(scrollIdle);
   scrollIdle = setTimeout(() => {
     if (chatTouching) return;
+    // Scroll events can lag the compositor during momentum scrolling.
+    if (list.scrollTop !== lastScrollTop) { settleChatScroll(); return; }
     chatScrolling = false;
     if (deferredScrollRender && lastChat) { deferredScrollRender = false; renderChat(lastChat); }
-    readingAnchor = nearBottom() ? null : captureChatAnchor();
+    else if (pendingHistoryStatus !== null && !chatFrame) {
+      const anchor = captureChatAnchor();
+      paintHistoryStatus();
+      restoreChatPosition(anchor);
+    }
+    readingAnchor = pinnedBottom ? null : captureChatAnchor();
     maybeLoadOlder();
   }, 150);
   updateToBottom();
   maybePrefetchOlder();
 }
-list.addEventListener('scroll', settleChatScroll, { passive: true });
+list.addEventListener('scroll', () => {
+  if (!restoringChatScroll && turnNavUser) showTurnNav();
+  if (!restoringChatScroll && !pinnedBottom) stabilizeChatReading();
+  settleChatScroll();
+}, { passive: true });
 let historyTouchY = 0;
-list.addEventListener('wheel', e => { restoringChatScroll = false; if (e.deltaY < 0) { historyArmed = true; pinnedBottom = false; } settleChatScroll(); }, { passive: true });
+list.addEventListener('wheel', e => { turnNavGesture(); if (!readingAnchor) readingAnchor = captureChatAnchor(); restoringChatScroll = false; if (e.deltaY < 0) { historyArmed = true; pinnedBottom = false; } settleChatScroll(); }, { passive: true });
 list.addEventListener('pointerdown', () => { historyArmed = true; }, { passive: true });
-list.addEventListener('touchstart', e => { historyTouchY = e.touches[0].clientY; chatTouching = true; chatScrolling = true; clearTimeout(scrollIdle); }, { passive: true });
-list.addEventListener('touchmove', e => { restoringChatScroll = false; if (e.touches[0].clientY > historyTouchY) { historyArmed = true; pinnedBottom = false; } historyTouchY = e.touches[0].clientY; }, { passive: true });
+list.addEventListener('touchstart', e => { readingAnchor = captureChatAnchor(); historyTouchY = e.touches[0].clientY; chatTouching = true; chatScrolling = true; clearTimeout(scrollIdle); }, { passive: true });
+list.addEventListener('touchmove', e => { turnNavGesture(); restoringChatScroll = false; if (e.touches[0].clientY > historyTouchY) { historyArmed = true; pinnedBottom = false; } historyTouchY = e.touches[0].clientY; }, { passive: true });
 for (const event of ['touchend', 'touchcancel']) list.addEventListener(event, () => { chatTouching = false; restoringChatScroll = false; settleChatScroll(); }, { passive: true });
-$('toBottom').onclick = () => { list.scrollTop = list.scrollHeight; };
+$('toBottom').onclick = () => { restoreChatPosition(null, true); };
 $('older').onclick = () => loadOlderMessages();
 
 // LaTeX in text typed by the user ($..$, $..$, \\(..\\), \\[..\\]): turned into .math placeholders for KaTeX.
@@ -904,6 +1231,26 @@ function typesetMath(root) {
   });
 }
 function dressMessage(el) {
+  // Codex history may contain raw Markdown when its native rendered block is unmounted.
+  // Format emphasis in text only; retain literal backticks/escapes and all existing rich markup.
+  if (currentApp === 'codex' && el.textContent.includes('**')) {
+    const raw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT), nodes = [];
+    while (raw.nextNode()) if (!raw.currentNode.parentElement.closest('a, pre, code, textarea, strong, b, .math')) nodes.push(raw.currentNode);
+    let ticks = '';
+    for (const node of nodes) {
+      const fragment = document.createDocumentFragment();
+      let last = 0;
+      for (const match of node.textContent.matchAll(/\\[\\*`]|`+|\*\*(\S(?:[^\n]*?\S)?)\*\*(?!\*)/g)) {
+        fragment.append(node.textContent.slice(last, match.index));
+        if (match[0].startsWith('`')) { ticks = ticks === match[0] ? '' : ticks || match[0]; fragment.append(match[0]); }
+        else if (match[1] && !ticks) { const strong = document.createElement('strong'); strong.textContent = match[1]; fragment.append(strong); }
+        else fragment.append(match[0]);
+        last = match.index + match[0].length;
+      }
+      fragment.append(node.textContent.slice(last));
+      node.replaceWith(fragment);
+    }
+  }
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   const nodes = [];
   while (walker.nextNode()) if (!walker.currentNode.parentElement.closest('a, pre, code, textarea, .math')) nodes.push(walker.currentNode);
@@ -961,8 +1308,9 @@ function forTerminalPaste(text) {
 }
 const chatImageUrls = new Map();
 function loadChatImages(root) {
-  return Promise.all([...root.querySelectorAll('[data-chat-image]')].map(img => {
+  return Promise.all([...root.querySelectorAll('[data-chat-image], .sentImage img')].map(img => {
     const id = img.dataset.chatImage;
+    if (!id) return img.decode().catch(() => {});
     const key = `${currentComputer()?.id}|${id}`;
     if (!chatImageUrls.has(key)) chatImageUrls.set(key, api('/api/chat-image/' + id).then(async response => {
       if (!response.ok) throw new Error('图片读取失败');
@@ -1037,6 +1385,13 @@ async function copyText(text, btn, terminal = true) {
 document.addEventListener('click', async e => {
   const imageCopy = e.target.closest('[data-copy-image]');
   if (imageCopy) { e.preventDefault(); await copyGeneratedImage(imageCopy.closest('.generatedImage').querySelector('img'), imageCopy); return; }
+  const sentImage = e.target.closest('#items .sentImage');
+  if (sentImage) {
+    e.preventDefault();
+    const img = sentImage.querySelector('img');
+    if (img.complete && img.naturalWidth) openChatImage(img.currentSrc || img.src);
+    return;
+  }
   const copyBtn = e.target.closest('.copy');
   const copyCode = !copyBtn && !e.target.closest('a') && e.target.closest('code.copyable');
   if (copyBtn || copyCode) {
@@ -1049,6 +1404,10 @@ document.addEventListener('click', async e => {
   const f = !b && e.target.closest('#items [data-file]');
   if (f) return openFile(f.dataset.file);
   if (!b) return;
+  if (currentApp === 'codex' && b.dataset.actionLabel === 'Copy message') {
+    await copyText(b.closest('.msg').copyText, b, false);
+    return;
+  }
   if (RISKY.test(b.textContent.trim()) && !await ask(`确定要点「${b.textContent.trim()}」吗？`, b.textContent.trim())) return;
   b.closest('.btns')?.querySelectorAll('button').forEach(button => { button.disabled = true; });
   send({ t: 'click', item: b.dataset.item, n: Number(b.dataset.n), actionId: b.dataset.actionId, label: b.dataset.actionLabel, sel: viewSel });
@@ -1076,6 +1435,55 @@ function showCodexSkills(rows) {
   };
   paint();
 }
+let codexFileRequest = 0;
+async function openCodexFilePicker(token) {
+  const scope = chatInputKey(), selected = new Map();
+  const start = token?.start ?? text.selectionStart, end = token?.caret ?? text.selectionEnd;
+  let directory = null;
+  mentionHide();
+  const paint = (note = '') => {
+    const showHidden = store.get('codex-files-show-hidden') === '1';
+    const rows = (directory?.entries || []).map((entry, index) => !showHidden && entry.name.startsWith('.') ? '' : entry.directory
+      ? `<button class="opt editorEntry editorFolder" data-cf-dir="${index}">${fileEntryIcon(true)}<span class="lbl">${esc(entry.name)}</span><span class="editorEntryArrow">›</span></button>`
+      : `<label class="opt editorEntry"><input type="checkbox" data-cf-file="${index}" ${selected.has(entry.path) ? 'checked' : ''} ${entry.selectable ? '' : 'disabled'}>${fileEntryIcon(false)}<span class="lbl">${esc(entry.name)}</span></label>`).join('');
+    openSheet('codex-files', `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px"><h3 style="margin:0;white-space:nowrap">添加电脑端文件</h3><button type="button" id="codexFileHidden" role="switch" aria-checked="${showHidden}" style="display:flex;align-items:center;gap:6px;flex:none;font-size:12px;padding:6px 0;background:transparent"><span>显示隐藏文件</span><span class="switch${showHidden ? ' on' : ''}" aria-hidden="true"></span></button></div><form id="codexFilePathForm" style="display:flex;gap:8px"><button type="button" id="codexFileUp" ${!directory || directory.path === directory.parent ? 'disabled' : ''}>↑ 上一级</button><input id="codexFilePath" aria-label="电脑目录" style="min-width:0;flex:1" value="${esc(directory?.path || '')}" placeholder="输入电脑目录路径"><button>前往</button></form><div class="hint">${esc(note)}</div><div id="codexFileRows" style="max-height:42vh;overflow-y:auto;overscroll-behavior:contain">${rows || '<div class="hint">暂无可显示的文件</div>'}</div><div class="askBtns"><button id="codexFileCancel">取消</button><button id="codexFileAdd" ${selected.size ? '' : 'disabled'}>添加（${selected.size}）</button></div>`);
+    $('codexFilePathForm').onsubmit = e => { e.preventDefault(); browse($('codexFilePath').value); };
+    $('codexFileUp').onclick = () => browse(directory.parent);
+    $('codexFileHidden').onclick = () => { store.set('codex-files-show-hidden', showHidden ? '0' : '1'); paint(note); };
+    $('codexFileRows').onclick = e => {
+      const b = e.target.closest('[data-cf-dir]');
+      if (b) browse(directory.entries[Number(b.dataset.cfDir)].path);
+    };
+    $('codexFileRows').onchange = e => {
+      const entry = directory.entries[Number(e.target.dataset.cfFile)];
+      if (e.target.checked) selected.set(entry.path, entry); else selected.delete(entry.path);
+      $('codexFileAdd').disabled = !selected.size;
+      $('codexFileAdd').textContent = `添加（${selected.size}）`;
+    };
+    $('codexFileCancel').onclick = closeSheet;
+    $('codexFileAdd').onclick = () => {
+      if (scope !== chatInputKey()) { closeSheet(); return status('会话已切换，请重新选择文件', false); }
+      if (takeMentions(text.value.slice(0, start) + text.value.slice(end)).length + selected.size > 12) return status('每条消息最多添加 12 个引用项', false);
+      const mentions = [...selected.values()].map(entry => ({ token: '@' + entry.name, q: entry.name, label: entry.name, path: entry.path, section: 'local-files', trigger: '@' }));
+      text.setRangeText(mentions.map(m => m.token).join(' ') + ' ', start, end, 'end');
+      MN.mentions.push(...mentions);
+      closeSheet(); autosize(); saveDraft(); text.focus();
+    };
+  };
+  const browse = async path => {
+    const serial = ++codexFileRequest;
+    paint('正在读取电脑目录…');
+    try {
+      const response = await api('/api/transfer/list?path=' + encodeURIComponent(path));
+      const data = await response.json();
+      if (serial !== codexFileRequest || sheetKind !== 'codex-files') return;
+      if (!response.ok) throw Error(data.error);
+      directory = data;
+      paint();
+    } catch (error) { if (serial === codexFileRequest && sheetKind === 'codex-files') paint(error.message); }
+  };
+  await browse('');
+}
 $('add').onclick = () => {
   if (currentApp === 'fusion') {
     openSheet('add', '<h3>添加附件</h3><button class="opt" data-control="img">上传图片</button><button class="opt" data-control="uploadDoc">上传文档</button>');
@@ -1091,7 +1499,7 @@ $('add').onclick = () => {
     $('sheet').querySelectorAll('[data-control]').forEach(b => b.onclick = () => { closeSheet(); $(b.dataset.control).click(); });
     return;
   }
-  const rows = [['new', '新建会话'], ['plan', `Plan：${c.plan ? '开' : '关'}`], ['skills', 'Skill · 技能'], ['files', '引用文件'], ['commands', '扩展与命令']];
+  const rows = [['new', '新建会话'], ['plan', `Plan：${c.plan ? '开' : '关'}`], ['skills', 'Skill · 技能'], ...(supportsCapability('fileReferences') ? [['local-files', '添加电脑端文件'], ['files', '引用文件']] : []), ['commands', '扩展与命令']];
   if (c.ide) rows.push(['ide', `IDE 上下文：${c.ide.on ? '开' : '关'}`]);
   if (c.run) rows.push(['run', `执行位置：${c.run}`]);
   if (c.actions) rows.push(['chat', '会话操作']);
@@ -1105,6 +1513,7 @@ $('add').onclick = () => {
     if (key === 'run') return send({ t: 'codexRun' });
     if (key === 'chat') return send({ t: 'codexChat' });
     if (key === 'skills') return send({ t: 'codexSkills' });
+    if (key === 'local-files') return openCodexFilePicker();
     text.focus();
     text.setRangeText(key === 'files' ? '@' : '/', text.selectionStart, text.selectionEnd, 'end');
     autosize(); saveDraft(); mentionUpdate();
