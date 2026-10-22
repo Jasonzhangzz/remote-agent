@@ -7,6 +7,7 @@ const store = {
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const themeName = () => ({ dark: '深色', light: '浅色', auto: '跟随系统' })[store.get('theme') || 'dark'];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const APP_VERSION = 'v200'; // keep in sync with the CACHE name in sw.js
 
 let base = null, info = null, ws = null, authed = false, failures = 0;
 let windowReady = false;
@@ -60,14 +61,30 @@ function openAgentList(refresh = false) {
   const cached = agentLists.get(agentListKey());
   if (cached) showAgents(cached);
   else status('正在读取 Agent 列表…');
-  send({ t: 'agents', automatic: !!cached && !refresh, silent: !!cached && !refresh });
+  send({ t: 'agents', automatic: !!cached && !refresh, silent: !!cached && !refresh, checkTrust: true });
 }
 let currentAppName = I18N.tr('当前应用');
 let viewSel = '';
+// Only migrated agents declare capabilities; others retain their existing entry rules.
+let capabilityOwner = '', agentCapabilities = null, capabilityBlock = '';
+let fusionSideCapabilities = {};
+function supportsCapability(name, existing = true) {
+  return capabilityOwner === currentApp && agentCapabilities ? agentCapabilities[name] === true : existing;
+}
+function capabilityState(name) {
+  const supported = supportsCapability(name);
+  if (capabilityOwner !== currentApp || !agentCapabilities) return { supported, available: supported, reason: '' };
+  let reason = !supported ? '此 Agent 不支持此功能' : !authed || !windowReady ? '尚未连接 Agent' : capabilityBlock;
+  if (!reason && ['model', 'effort', 'fileReferences'].includes(name) && !chatStale && lastChat?.readonly) reason = '当前对话尚不可操作';
+  const effort = name === 'effort' && menuCache.get(menuCacheKey('effort'));
+  if (!reason && effort && effort.model === lastChat?.model && !effort.items?.length) reason = '当前模型没有可选的思考强度';
+  return { supported, available: supported && !reason, reason };
+}
+
 const appMessage = template => I18N.tr(template).replaceAll('{app}', currentAppName);
 function updateAppText() {
   $('emptyHint').textContent = appMessage('请在 {app} 里打开 Agent 对话，或切到「画面」查看。');
-  text.placeholder = mode === 'terminal' ? I18N.tr('发给终端…') : I18N.tr('输入你的问题，或粘贴图片、文档…');
+  text.placeholder = mode === 'terminal' ? I18N.tr('发给终端…') : questionCompose?.sel === viewSel ? '回答当前问题…（仅提交文字）' : I18N.tr('输入你的问题，或粘贴图片、文档…');
 }
 
 // iOS scrolls the page to reveal the focused field, which throws the chat off screen.
@@ -91,7 +108,13 @@ function fitViewport() {
     const overflow = Math.max(0, input.closest('footer').getBoundingClientRect().bottom - vv.height - Math.max(0, vv.offsetTop));
     const available = input.offsetHeight + $('listWrap').clientHeight - 72 - overflow;
     document.body.style.setProperty('--composer-max-height', Math.max(52, Math.floor(Math.min(vv.height * .28, available))) + 'px');
-  } else document.body.style.removeProperty('--composer-max-height');
+    const room = input.closest('footer').getBoundingClientRect().top - document.querySelector('header').getBoundingClientRect().bottom
+      - $('sessBar').offsetHeight - $('actionBar').offsetHeight - 16;
+    document.body.style.setProperty('--question-max-height', Math.max(0, Math.floor(room)) + 'px');
+  } else {
+    document.body.style.removeProperty('--composer-max-height');
+    document.body.style.removeProperty('--question-max-height');
+  }
   if (stickOnKeyboard) list.scrollTop = list.scrollHeight;
 }
 window.addEventListener('resize', fitViewport);
@@ -105,9 +128,23 @@ fitViewport();
 function fitOrientation() {
   const t = window.screen.orientation?.type;
   document.body.classList.toggle('land', t ? t.startsWith('landscape') : window.screen.width > window.screen.height);
+  // Screen size, not viewport: an open keyboard must never flip the layout.
+  document.body.classList.toggle('wide', Math.min(window.screen.width, window.screen.height) >= 520);
+  // .split = the rail layout. Width-based (not orientation): keyboards shrink only the
+  // height, so near-square foldables and portrait tablets get the rail too.
+  document.body.classList.toggle('split',
+    document.body.classList.contains('wide') && window.innerWidth >= 768
+    && !document.body.classList.contains('visual'));
+  fitRail();
+}
+// Rail width: stored preference wins; otherwise auto-collapse under 1100px.
+function fitRail() {
+  const v = store.get('rail');
+  document.body.classList.toggle('railCollapsed', v ? v === 'collapsed' : window.innerWidth < 1100);
 }
 window.screen.orientation?.addEventListener('change', fitOrientation);
 window.addEventListener('orientationchange', fitOrientation);
+window.addEventListener('resize', fitOrientation);
 fitOrientation();
 
 // In-progress lines end with … and are cleared when the result arrives, or after a few seconds
@@ -131,7 +168,7 @@ function status(text, ok = true) {
   clearTimeout(statusTimer);
   pendingStatus = ok && ACTION_PENDING.has(text) ? text : '';
   $('msg').textContent = text || '';
-  $('msg').className = ok ? '' : 'err';
+  $('msg').className = text === '已连接' ? 'quiet' : (ok ? '' : 'err');
   const keep = text === '已连接' || (ok && /…$/.test(text || '') && !pendingStatus);
   if (!text || !ok || keep || pendingStatus) return;
   const wait = 2800;
@@ -156,12 +193,14 @@ function send(obj) {
     if (name) $('titleText').textContent = name + '…';
   }
   if (obj.t === 'openMenu') obj.requestId = ++menuRequest;
-  if (currentApp === 'codex' && ['settings', 'codexSetting'].includes(obj.t)) obj.requestId = ++codexSettingsRequest;
+  if (currentApp === 'codex' && ['settings', 'codexSetting', 'codexInstructions'].includes(obj.t)) obj.requestId = ++codexSettingsRequest;
   if (ws && ws.readyState === 1 && authed) ws.send(JSON.stringify(obj));
   else status('未连接', false);
 }
 function setWindowReady(ready) {
+  if (!ready && typeof cancelVoice === 'function') cancelVoice();
   windowReady = ready;
+  if (typeof updateVoiceButton === 'function') updateVoiceButton();
   $('send').disabled = $('sendNow').disabled = !ready;
 }
 
