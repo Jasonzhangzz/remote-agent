@@ -46,7 +46,7 @@ async function enableNotify() {
     window.AgentRemoteApp.setNotify(nativeConfig());
     notifyOn = true;
     setTimeout(() => { if (window.AgentRemoteApp.listenStatus?.() !== 'connected') showBgSheet(); }, 4000);
-    return status('通知已开启，正在连接电脑。华为等手机请在「设置 → 应用启动管理」里允许本 App 后台活动');
+    return status('通知已开启，正在连接电脑。请在手机的电池设置里允许本 App 后台运行，否则切到后台后会收不到通知');
   }
   if (iosPush()) {
     try {
@@ -187,9 +187,24 @@ $('sheet').addEventListener('click', async e => {
     if (chev) chev.textContent = open ? '▾' : '▸';
     const body = b.nextElementSibling;
     if (body) body.hidden = !open;
+    if (open && sheetKind === 'agents') body?.querySelectorAll('[data-project-load]').forEach(el => {
+      el.textContent = '正在加载会话…';
+      send({ t: 'agents', projectWindow: el.dataset.projectLoad, automatic: true, silent: true });
+    });
     return;
   }
-  if (b.dataset.win) { closeSheet(); status('正在切换窗口…'); return send({ t: 'attach', id: b.dataset.win, ...currentComputer()?.selections?.[b.dataset.win] }); }
+  if (b.dataset.projectLoad) {
+    b.textContent = '正在加载会话…';
+    return send({ t: 'agents', projectWindow: b.dataset.projectLoad, automatic: true, silent: true });
+  }
+  if (b.dataset.launchMissing) {
+    status('正在启动 Agent…');
+    b.disabled = true;
+    const sub = b.querySelector('.sub');
+    if (sub) sub.textContent = I18N.tr('正在启动…');
+    return send({ t: 'launchAgents', apps: b.dataset.launchMissing.split(',') });
+  }
+  if (b.dataset.win) return switchToWindow(b.dataset.win);
   if ('fusionTrust' in b.dataset) { closeSheet(); return send({ t: 'fusionTrust', approve: b.dataset.fusionTrust === 'yes' }); }
   if ('fusionDir' in b.dataset) { status('正在读取项目…'); return send({ t: 'fusionProjects', path: b.dataset.fusionDir }); }
   if ('fusionPath' in b.dataset) {
@@ -202,6 +217,10 @@ $('sheet').addEventListener('click', async e => {
     if (!await ask('在当前项目创建新会话，并携带旧会话最近的历史摘录？原会话保留，不会发送任务。', '续接')) return;
     closeSheet(); status('正在创建会话…');
     return send({ t: 'fusionContinue', side: b.dataset.fusionSide, id: b.dataset.fusionContinue });
+  }
+  if ('saveInstructions' in b.dataset) {
+    status('正在保存指令…');
+    return send({ t: 'codexInstructions', text: $('codexInstructions').value });
   }
   if (b.dataset.codexSetting) {
     const label = b.textContent.trim();
@@ -235,7 +254,13 @@ $('sheet').addEventListener('click', async e => {
     return send({ t: 'newProject', parent: b.dataset.projectNew, name: name.trim(), newSession: true });
   }
   if ('projectChat' in b.dataset) { closeSheet(); status('正在打开项目…'); return send({ t: 'openProject', path: b.dataset.projectChat, newSession: true }); }
-  if ('projectTrust' in b.dataset) { closeSheet(); status('正在打开项目…'); return send({ t: 'projectTrust', approve: b.dataset.projectTrust === 'yes' }); }
+  if ('projectTrust' in b.dataset) {
+    const here = currentComputer();
+    const last = here?.lastConversation;
+    const returnTo = last?.windowId !== here?.windowId ? last : here?.previousConversation;
+    closeSheet(); status('正在打开项目…');
+    return send({ t: 'projectTrust', approve: b.dataset.projectTrust === 'yes', returnTo });
+  }
   if (b.dataset.open) { closeSheet(); status('正在打开项目…'); return send({ t: 'openProject', path: b.dataset.open }); }
   if (b.dataset.dir) { status('正在读取文件夹…'); return send({ t: 'projects', path: b.dataset.dir }); }
   if (b.dataset.docsFile) { closeSheet(); return openFile(b.dataset.docsFile, b.dataset.docsEditor === 'true'); }
@@ -245,6 +270,7 @@ $('sheet').addEventListener('click', async e => {
     return send({ t: 'docs', editor: editorBrowsing, root: b.dataset.root, host: b.dataset.docsHost || '', path: b.dataset.docsUp });
   }
   if (b.dataset.docsRoot) { status('正在读取文档…'); return send({ t: 'docs', editor: editorBrowsing, root: b.dataset.docsRoot, host: b.dataset.docsHost || '', path: b.dataset.docsDir || b.dataset.docsRoot }); }
+  if (b.dataset.settingsNav) { status('正在读取设置…'); return send({ t: 'settings', section: b.dataset.settingsNav }); }
   if (b.dataset.setting) { status('正在修改…'); return send({ t: 'toggleSetting', label: b.dataset.setting }); }
   if (b.dataset.termDel) {
     if (!await ask(`删除终端「${b.dataset.termName || ''}」？\n里面正在跑的命令会停掉。`, '删除')) return;
@@ -256,7 +282,7 @@ $('sheet').addEventListener('click', async e => {
     if (b.dataset.fusion === 'fast') return send({ t: 'fusionPick', part: 'fast' });
     menuSheetKind = `fusion-${b.dataset.fusion}`;
     const fm = menuCache.get(menuCacheKey(`fusion-${b.dataset.fusion}`));
-    if (fm) showMenu(fm.kind, fm.items, fm.max, fm.fusion, fm.fast, fm.model, true);
+    if (fm) showMenu(fm.kind, fm.items, fm.max, fm.fusion, fm.fast, fm.model, true, fm.pricing);
     return send({ t: 'fusionOptions', part: b.dataset.fusion });
   }
   if (b.dataset.kind) {
@@ -271,6 +297,10 @@ $('sheet').addEventListener('click', async e => {
     if (b.dataset.kind === 'mode' && b.dataset.label === 'Bypass Permissions' && !b.classList.contains('cur')
       && !await ask('切到「Bypass Permissions」？\nAgent 之后的所有操作（运行命令、改文件、删文件）都会自动批准，不再询问你。', '切换')) return;
     closeSheet();
+    if (b.dataset.kind === 'model' || b.dataset.kind === 'effort') {
+      menuCache.delete(menuCacheKey('model'));
+      menuCache.delete(menuCacheKey('effort'));
+    }
     if (/^fusion-model-[ab]$/.test(b.dataset.kind)) fusionModelSide = b.dataset.kind.slice(-1);
     if (b.dataset.kind !== 'codex-run' && b.dataset.kind !== 'codex-chat' && !/^fusion-(model|effort)-/.test(String(b.dataset.kind || ''))) beginSwitch(b.dataset.kind);
     return send({ t: 'pickMenu', kind: b.dataset.kind, label: b.dataset.label });
@@ -293,15 +323,38 @@ $('sheet').addEventListener('click', async e => {
   const act = b.dataset.act;
   if ('deviceRemoveCancel' in b.dataset) { deviceRemoval = []; return renderDevices(); }
   if ('deviceRemoveConfirm' in b.dataset) return removePairedDevices(deviceRemoval, true);
+  if (b.dataset.entryInvite) return inviteDeviceEntry(b.dataset.entryInvite);
+  if ('entryCopy' in b.dataset) return copyText(deviceInvitation.link, b);
+  if (b.dataset.entryDecide) return decideDeviceEntry(b);
+  if (b.dataset.deviceGroupRemove) return removePairedDevices(pairedDevices.filter(d => d.groupId === b.dataset.deviceGroupRemove).map(d => d.id));
+  if (b.dataset.deviceGroupTarget) return moveDeviceEntries(b.dataset.deviceGroupTarget);
+  if (b.dataset.deviceGroupRename) {
+    const group = deviceGroups().find(g => g.id === b.dataset.deviceGroupRename);
+    const name = window.prompt('设备名称', group.name)?.trim();
+    if (name) return moveDeviceEntries(group.id, name, group.entries.map(d => d.id));
+    return;
+  }
+  if ('deviceGroupNew' in b.dataset) {
+    const name = window.prompt('设备名称')?.trim();
+    if (name) return moveDeviceEntries('', name);
+    return;
+  }
   if (b.dataset.listAction) return handleListAction(b.dataset.listAction);
   if (b.dataset.groupMove != null) return moveSelectedComputers(b.dataset.groupMove);
   if (b.dataset.groupRename != null) return editComputerGroup(b.dataset.groupRename);
   if (b.dataset.groupDelete != null) return deleteComputerGroup(b.dataset.groupDelete);
   if (act === 'toggleChanges') { toggleChangeNotice(); return closeSheet(); }
+  if (act === 'executionToggle') return toggleExecutionRecords();
   if (act === 'newTerm') { closeSheet(); status('正在新建终端…'); return send({ t: 'newTerminal' }); }
   else if (act === 'fusionHistory') { closeSheet(); return send({ t: 'fusionHistory' }); }
   else if (act === 'fusionNew') { closeSheet(); return send({ t: 'fusionNew' }); }
+  else if (act === 'localVoiceToggle') return toggleLocalVoice();
+  else if (act === 'localVoiceMenu') return showLocalVoiceMenu();
+  else if (act === 'voiceBack') return showMainMenu();
+  else if (b.dataset.voiceEngine) return selectVoiceEngine(b.dataset.voiceEngine);
+  else if (act === 'transfer') return openTransfer();
   else if (act === 'model') return requestMenu('model', '读取模型列表…');
+  else if (act === 'mode') return requestMenu('mode', '读取模式列表…');
   else if (act === 'permission') return requestMenu(lastChat?.permission ? 'permission' : 'mode', '读取权限…');
   else if (act === 'agentsRefresh') return openAgentList(true);
   else if (act === 'projects') { status('正在读取项目…'); return send({ t: 'projects' }); }
@@ -310,9 +363,19 @@ $('sheet').addEventListener('click', async e => {
     openSheet('codex-reset', `<h3>Codex 额度重置</h3><p>官方发放的重置券用于恢复指定的额度窗口，不是充值余额。</p><ol><li>登录与电脑端 Codex 相同的 ChatGPT 账号，打开官方额度页面。</li><li>找到 Usage limit resets → Available，检查可用次数、重置范围和到期时间。</li><li>点击所选券的 Use reset，按官方页面提示确认。</li><li>完成后回到这里，点击额度展示并刷新数据。</li></ol><p class="hint">Full reset 用于恢复 5 小时和每周额度；具体范围以券的说明为准。已使用记录可在 History 查看。</p><a class="opt" href="https://chatgpt.com/codex/settings/usage" target="_blank" rel="noopener noreferrer">打开官方额度页面</a>`);
   }
   else if (act === 'editor') { return startEditor(); }
-  else if (act === 'settings') { status('正在读取设置…'); return send({ t: 'settings' }); }
+  else if (act === 'settings') return openSettings();
   else if (act === 'screen') { closeSheet(); return setMode('screen'); }
   else if (act === 'changeUrl') window.AgentRemoteApp?.changeUrl();
+  else if (act === 'connPartialToggle' || act === 'connLaunchToggle') {
+    const partial = act === 'connPartialToggle';
+    const on = partial ? !connAutoPartialOn() : store.get('conn-auto-launch') !== '1';
+    store.set(partial ? 'conn-auto-partial' : 'conn-auto-launch', on ? '1' : '0');
+    const row = $(partial ? 'menuPartialRow' : 'menuLaunchRow');
+    row?.setAttribute('aria-checked', String(on));
+    row?.querySelector('.switch')?.classList.toggle('on', on);
+    if (conn.active) connRender();
+    if (partial && on) { conn.enterRequested = true; connMaybeEnter(); }
+  }
   else if (act === 'notifyToggle') {
     const row = $('notifySwitchRow');
     if (row?.getAttribute('aria-busy') === 'true') return;
@@ -451,13 +514,45 @@ async function removeComputer(i) {
   if (!c) return showComputers();
   return removeComputers([c.key]);
 }
+// A deleted computer must forget this phone even when we're not connected to it, or it keeps pushing notifications here.
+// Queued in localStorage and retried on the next start until the relay answers.
+const logoutQueue = () => { try { return JSON.parse(store.get('pending-logouts') || '[]'); } catch { return []; } };
+function queueLogouts(list) {
+  const q = logoutQueue().filter(p => !list.some(c => c.token === p.token));
+  store.set('pending-logouts', JSON.stringify([...q, ...list.map(c => ({ id: c.id || '', key: c.key, token: c.token, discovery: c.discovery || new URL('url.json', location.href).href }))]));
+}
+async function relayOf(c) {
+  const reg = await fetch(c.discovery + '?t=' + Date.now(), { cache: 'no-store', signal: AbortSignal.timeout(8000) }).then(r => r.json());
+  if (reg.self) return new URL(c.discovery).origin;
+  if (reg.v === 2 && reg.data) return decryptEntry(c.key, reg);
+  const id = c.id || await computerIdFromKey(c.key);
+  const entry = (reg.computers || []).find(e => e.id === id);
+  if (!entry) throw Error('not published');
+  return decryptEntry(c.key, entry);
+}
+async function flushLogouts() {
+  for (const p of logoutQueue()) {
+    let done = false;
+    try {
+      const r = await fetch(await relayOf(p) + '/api/logout', { method: 'POST', cache: 'no-store', signal: AbortSignal.timeout(8000),
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + p.token }, body: '{}' });
+      const body = r.status === 401 ? await r.json().catch(() => ({})) : {};
+      // 401 without needTotp: the relay already forgot this device. 403: that relay doesn't accept this page's origin; the relay's own expiry covers it.
+      done = r.ok || r.status === 403 || (r.status === 401 && !body.needTotp);
+    } catch {}
+    if (done) store.set('pending-logouts', JSON.stringify(logoutQueue().filter(x => x.token !== p.token)));
+  }
+}
 async function removeComputers(keys) {
   const selected = loadComputers().filter(c => keys.includes(c.key));
   if (!selected.length) return;
   if (!await ask(`删除电脑「${selected.map(c => c.name || '电脑').join('、')}」？\n这台手机不再连接它们。`, '删除')) return showComputers();
   const cur = currentComputer();
   const removingCurrent = cur && keys.includes(cur.key);
-  if (removingCurrent && authed) await post('/api/logout').catch(() => {});
+  let loggedOut = '';
+  if (removingCurrent && authed) await post('/api/logout').then(r => { if (r.ok) loggedOut = cur.key; }).catch(() => {});
+  queueLogouts(selected.filter(c => c.key !== loggedOut));
+  flushLogouts();
   const nextList = loadComputers().filter(x => !keys.includes(x.key));
   const next = nextList[0];
   saveComputers(nextList, removingCurrent ? '' : (cur?.key || ''));
@@ -474,3 +569,16 @@ async function removeComputers(keys) {
   showComputers();
 }
 
+
+$('sheet').addEventListener('change', e => {
+  const field = e.target.closest('[data-codex-field]');
+  if (field) { status('正在读取设置…'); send({ t: 'codexSetting', id: field.dataset.codexField, value: field.value }); }
+});
+
+$('sheet').addEventListener('change', e => {
+  const field = e.target.closest('[data-setting-field]');
+  if (field) { status('正在修改…'); send({ t:'toggleSetting', label:field.dataset.settingField, value:field.value }); }
+});
+
+// Retry queued logouts from previous deletions (fire and forget; must not block startup).
+flushLogouts();
