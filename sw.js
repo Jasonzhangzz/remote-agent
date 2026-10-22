@@ -1,10 +1,10 @@
 // Caches the app shell so the installed app opens instantly; live data (url.json, relay) always goes to the network.
-const CACHE = 'remote-agent-v104';
-const SHELL = ['./', 'index.html', 'app.css?v=104', 'i18n.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png',
-  'js/core.js', 'js/gate.js', 'js/net.js', 'js/sheets.js', 'js/notify.js', 'js/mode.js', 'js/chat.js?v=87',
-  'js/history.js?v=87', 'js/files.js', 'js/screen.js?v=87', 'js/terminal.js', 'js/composer.js?v=87', 'js/voice.js',
-  'js/scanner.js',
-  'js/latency.js',
+const CACHE = 'remote-agent-v200'; // keep in sync with APP_VERSION in js/core.js
+const SHELL = ['./', 'index.html', 'app.css?v=200', 'i18n.js?v=199', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'logo.png',
+  'js/core.js?v=200', 'js/gate.js?v=122', 'js/net.js?v=188', 'js/sheets.js?v=194', 'js/notify.js?v=180', 'js/mode.js?v=158', 'js/chat.js?v=195',
+  'js/history.js?v=200', 'js/files.js?v=167', 'js/screen.js?v=123', 'js/terminal.js?v=116', 'js/composer.js?v=193', 'js/voice.js?v=155', 'js/local-voice.js?v=196', 'js/voice-worklet.js?v=133',
+  'js/transfer.js?v=137', 'js/scanner.js',
+  'js/latency.js?v=142', 'js/image-editor.js?v=181',
   'logo-cursor-dark.svg', 'logo-cursor-light.svg',
   'logo-devin-dark.svg', 'logo-devin-light.svg',
   'logo-codex-dark.svg', 'logo-codex-light.svg'];
@@ -22,6 +22,11 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.endsWith('url.json')) return;
+  // The versioned capture processor is already precached; do not wait on the network at mic press.
+  if (url.pathname.endsWith('/js/voice-worklet.js') && url.searchParams.has('v')) {
+    e.respondWith(caches.open(CACHE).then(async cache => await cache.match(e.request) || fetch(e.request)));
+    return;
+  }
   // Network first so app updates show up immediately; cache only as an offline fallback.
   e.respondWith(fetch(e.request)
     .then(res => {
