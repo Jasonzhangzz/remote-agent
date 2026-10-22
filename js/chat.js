@@ -21,6 +21,7 @@ itemsEl.addEventListener('click', async e => {
   const tr = e.target.closest('[data-ttoggle]');
   if (tr && !e.target.closest('[data-file]')) {
     const box = tr.closest('.toolrow');
+    box.classList.add('anim');
     box.classList.toggle('open');
     const chev = tr.querySelector('.chev');
     if (chev) chev.textContent = box.classList.contains('open') ? '▾' : '▸';
@@ -42,11 +43,17 @@ itemsEl.addEventListener('click', async e => {
   }
 });
 const thoughtFull = new Map();
+function setThought(id, text) {
+  thoughtFull.set(id, text);
+  const hit = cache.get(id);
+  if (hit) {
+    hit.key = null;
+    queueChatRender();
+  }
+}
 function requestThought(id) {
   if (thoughtFull.has(id)) return;
-  thoughtFull.set(id, undefined);
-  const body = itemsEl.querySelector(`[data-think="${CSS.escape(id)}"]`)?.closest('.thinking')?.querySelector('.thb');
-  if (body) { body.textContent = '加载中…'; body.classList.add('loading'); }
+  setThought(id, undefined);
   send({ t: 'thought', i: id });
 }
 const thoughtObserver = new IntersectionObserver(entries => {
@@ -58,11 +65,7 @@ const thoughtObserver = new IntersectionObserver(entries => {
   }
 }, { root: list, rootMargin: '100px' });
 function onThought(m) {
-  thoughtFull.set(m.i, m.text ?? null);
-  const box = document.querySelector(`[data-think="${CSS.escape(m.i)}"]`)?.closest('.thinking')?.querySelector('.thb');
-  if (!box) return;
-  box.classList.remove('loading');
-  box.textContent = m.text ?? '内容未保存';
+  setThought(m.i, m.text ?? null);
 }
 
 function buttonsHtml(labels, item, actions = []) {
@@ -114,8 +117,11 @@ function paintThinking(el, it) {
   btn.dataset.more = more ? '1' : '';
   btn.querySelector('.tht').textContent = thinkingTitle(it.t);
   btn.querySelector('.tha').textContent = rest || more ? (open ? '收起' : '展开') : '';
-  const follow = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
-  if (box.textContent !== rest) box.textContent = rest;
+  const follow = open && it.live && box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  const loading = more && thoughtFull.has(it.i) && full === undefined;
+  const body = loading ? '加载中…' : more && full === null ? '内容未保存' : rest;
+  box.classList.toggle('loading', loading);
+  if (box.textContent !== body) box.textContent = body;
   box.hidden = !open;
   if (open && more && !thoughtFull.has(it.i)) thoughtObserver.observe(el);
   if (open && it.live && follow) box.scrollTop = box.scrollHeight;
@@ -152,6 +158,29 @@ function renderTool(el, it) {
     + (chips ? `<div class="chips">${chips}</div>` : '');
 }
 
+// A running command's output grows line by line. Patch the existing row in place so the row's open state,
+// the output box's own scroll position and the expand animation are not reset on every new line.
+function patchToolRow(el, fresh) {
+  if (el.children.length !== fresh.children.length) return false;
+  const kids = [...el.children], next = [...fresh.children];
+  if (kids.some((k, n) => k.tagName !== next[n].tagName || k.className !== next[n].className
+    || (!k.matches('pre.tcmd, .trow') && k.outerHTML !== next[n].outerHTML))) return false;
+  const open = el.classList.contains('open');
+  kids.forEach((k, n) => {
+    const f = next[n];
+    if (k.matches('.trow')) {
+      const chev = f.querySelector('.chev');
+      if (chev) chev.textContent = open ? '▾' : '▸';
+      if (k.innerHTML !== f.innerHTML) k.innerHTML = f.innerHTML;
+    } else if (k.textContent !== f.textContent) {
+      const follow = k.scrollHeight - k.scrollTop - k.clientHeight < 24;
+      k.textContent = f.textContent;
+      if (follow) k.scrollTop = k.scrollHeight;
+    }
+  });
+  return true;
+}
+
 // Devin's todo list ("N / M tasks done"): progress bar + checklist; the same markup feeds the Tasks sheet.
 const taskOpen = new Set();
 const TASK_ICON = { done: '✓', in_progress: '◐', pending: '○' };
@@ -175,7 +204,7 @@ function renderItem(it) {
     if (it.src === 'devin') el.insertAdjacentHTML('beforeend', `<div class="rv"><button class="foldBtn" data-fold="${esc(it.i)}" title="折叠这一轮">▾</button><span class="turnSum"></span><button class="revertBtn" data-revert="${esc(it.i)}">回到这里</button></div>`);
   }
   // it.h comes from the whitelist sanitizer in server/page/common.js (clean): plain tags only, text escaped.
-  else if (it.k === 'assistant') { el.innerHTML = it.h || ''; dressMessage(el); }
+  else if (it.k === 'assistant') { el.copyText = it.t || ''; el.innerHTML = it.h || ''; dressMessage(el); }
   else if (it.k === 'thinking') paintThinking(el, it);
   else if (it.k === 'tool') {
     if (it.kind && (it.src === 'devin' || it.src === 'codex')) { renderTool(el, it); el.classList.add('toolrow'); if (it.kind !== 'command') el.classList.add('open'); }
@@ -188,9 +217,17 @@ function renderItem(it) {
   if (it.agents?.length) el.insertAdjacentHTML('beforeend', `<div class="btns">${it.agents.map(a => `<button data-codex-agent="${esc(a.id)}">查看 ${esc(a.title)}</button>`).join('')}</div>`);
   if (it.images?.length) {
     el.insertAdjacentHTML('beforeend', it.images.filter(src => /^(https?:|data:image\/|chat-image:)/.test(src)).map(src => src.startsWith('chat-image:')
-      ? `<a target="_blank" rel="noopener"><img data-chat-image="${esc(src.slice(11))}" alt="生成的图片" style="max-width:100%;border-radius:8px"></a>`
-      : `<a href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="生成的图片" style="max-width:100%;border-radius:8px"></a>`).join(''));
-    el.chatImagesReady = loadChatImages(el);
+      ? `<a class="${it.k === 'human' ? 'sentImage' : ''}" target="_blank" rel="noopener"><img data-chat-image="${esc(src.slice(11))}" alt="生成的图片" style="max-width:100%;border-radius:8px"></a>`
+      : `<a class="${it.k === 'human' ? 'sentImage' : ''}" href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="生成的图片" style="max-width:100%;border-radius:8px"></a>`).join(''));
+    el.chatImagesReady = loadChatImages(el).then(() => {
+      if (it.k !== 'human') return;
+      const images = [...el.querySelectorAll('.sentImage img')];
+      if (images.length && images.every(img => img.complete && img.naturalWidth)) {
+        const bubble = el.querySelector('.bubble');
+        bubble.textContent = (it.t || '').replace(/(?:\n)?\[图片 \d+\](?=\n\[附件 \d+\]$|$)/, '');
+        bubble.hidden = !bubble.textContent.trim();
+      }
+    });
   }
   if (it.b && it.k !== 'human') el.insertAdjacentHTML('beforeend', `<div class="btns">${buttonsHtml(it.b, it.btnItem || it.i, it.actions)}</div>`);
   if (it.k !== 'human') addImageCopyButtons(el);
@@ -198,6 +235,9 @@ function renderItem(it) {
 }
 
 const nearBottom = () => list.scrollHeight - list.scrollTop - list.clientHeight < 120;
+// Following the chat means the user is at the very end (or never left it); "close to the end" is still reading.
+const atBottom = () => list.scrollHeight - list.scrollTop - list.clientHeight < 8;
+const followingChat = () => pinnedBottom || atBottom();
 
 // pickMenu has no completion message until the relay restarts, so clear "切换中…"
 // when the composer model/mode actually changes, or after a short fallback.
@@ -293,6 +333,7 @@ const lruPut = (map, key, val, max) => { map.delete(key); map.set(key, val); whi
 let menuSheetKind = '', chatStale = false;
 let currentProject = '', currentTerminal = '';
 function updateTitle() {
+  document.body.dataset.app = currentApp || '';
   const first = lastChat?.items?.find(it => it.k === 'user');
   const conversation = mode === 'terminal' ? currentTerminal : (lastChat?.title || first?.t || '');
   $('titleText').textContent = currentAppName || '连接中…';
@@ -301,6 +342,7 @@ function updateTitle() {
   $('titlePlan').hidden = !plan;
   $('titleProject').textContent = cleanWindowTitle(currentProject).replace(/\s+-\s+Devin(?:\s+-.*)?$/, '') || conversation.split('\n')[0].slice(0, 40);
   $('title').title = [cleanWindowTitle(currentProject), conversation].filter(Boolean).join(' · ');
+  paintRail();
 }
 // Devin sessions: each session has its own rows, thought bodies, tasks, questions and queue. When the desktop
 // shows another session, drop everything cached for the old one so the two never mix in one scroll.
