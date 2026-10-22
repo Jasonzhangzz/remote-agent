@@ -6,19 +6,24 @@ function updateTermEmpty() {
   $('termText').hidden = !(mode === 'terminal' && termState === 'text');
 }
 function setMode(m) {
+  if (typeof cancelVoice === 'function') cancelVoice();
   saveDraft();
   mode = m;
+  if (m !== 'terminal') clearTermSelection();
   restoreDraft(); updateTitle();
   store.set('mode', m);
   $('tabChat').classList.toggle('on', m === 'chat');
   $('tabTerm').classList.toggle('on', m === 'terminal');
+  $('tabChat').setAttribute('aria-pressed', String(m === 'chat'));
+  $('tabTerm').setAttribute('aria-pressed', String(m === 'terminal'));
   $('chatView').classList.toggle('active', m === 'chat');
   $('screenView').classList.toggle('active', m === 'screen' || m === 'terminal');
   $('chatTools').hidden = m !== 'chat';
   $('termTools').hidden = m !== 'terminal';
+  $('termToolsLabel').hidden = m !== 'terminal';
   $('screenTools').hidden = m === 'terminal';
   $('screenKeys').hidden = true;
-  view.classList.toggle('gesture', m === 'screen' || m === 'terminal');
+  view.classList.toggle('gesture', m === 'screen');
   document.body.classList.toggle('term', m === 'terminal');
   document.body.classList.toggle('visual', m === 'screen');
   for (const id of ['visualHeader', 'visualCaption', 'visualHint']) $(id).hidden = m !== 'screen';
@@ -33,11 +38,15 @@ function setMode(m) {
   updateTermEmpty();
   $('visualEmpty').hidden = m !== 'screen' || visualState.state === 'live';
   stage.hidden = m === 'screen' && visualState.state !== 'live';
-  if (m === 'screen') { visualState = {state: 'idle'}; renderVisualState(visualState); }
+  if (m === 'screen') { visualState = {state: 'idle', message: I18N.tr('正在查找窗口…')}; renderVisualState(visualState); }
   if (m === 'screen' || m === 'terminal') { layoutStage(); applyQuality(); }
+  fitOrientation();
+  if (typeof updateComposeCompact === 'function') updateComposeCompact();
 }
-$('tabChat').onclick = () => setMode('chat');
-$('tabTerm').onclick = () => setMode('terminal');
+// On thin phones the two tabs are stacked into one toggle, so tapping the front (current) one switches too.
+const stackedTabs = () => !document.body.classList.contains('wide');
+$('tabChat').onclick = () => setMode(mode === 'chat' && stackedTabs() ? 'terminal' : 'chat');
+$('tabTerm').onclick = () => setMode(mode === 'terminal' && stackedTabs() ? 'chat' : 'terminal');
 
 // Swipe from the terminal back to the chat (left to right). The chat never swipes to the terminal: use the tab.
 // A mostly vertical move keeps scrolling.
@@ -48,7 +57,7 @@ document.querySelector('main').addEventListener('touchstart', e => {
   if ($('sheet').classList.contains('open') || $('viewer').classList.contains('open') || $('shade').classList.contains('open')) return;
   if (e.target.closest('button, a, input, textarea, select, .codebox')) return;
   const t = e.touches[0];
-  swipe = { x: t.clientX, y: t.clientY, target: e.target, locked: '' };
+  swipe = { x: t.clientX, y: t.clientY, target: e.target, locked: '', at: Date.now() };
 }, { passive: true });
 document.querySelector('main').addEventListener('touchmove', e => {
   if (!swipe || e.touches.length !== 1) return;
@@ -68,6 +77,7 @@ document.querySelector('main').addEventListener('touchend', e => {
   if (Math.abs(dx) < 56 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
   const term = $('termText');
   if (mode === 'terminal' && term.contains(start.target)) {
+    if (terminalSelection() || Date.now() - start.at > 450) return;
     if (dx > 0 && term.scrollLeft > 2) return;
     if (dx < 0 && term.scrollLeft + term.clientWidth < term.scrollWidth - 2) return;
   }
