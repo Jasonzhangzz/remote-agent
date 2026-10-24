@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const PRIMARY = /^(run|allow|accept|approve|keep|continue|build|yes|运行|允许|接受|继续)/i;
+const PRIMARY = /^(run|allow|accept|approve|keep|continue|build|yes|retry|运行|允许|接受|继续|重试)/i;
 const store = {
   get: k => localStorage.getItem('cr-' + k),
   set: (k, v) => v == null ? localStorage.removeItem('cr-' + k) : localStorage.setItem('cr-' + k, v),
@@ -7,7 +7,7 @@ const store = {
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const themeName = () => ({ dark: '深色', light: '浅色', auto: '跟随系统' })[store.get('theme') || 'dark'];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const APP_VERSION = 'v200'; // keep in sync with the CACHE name in sw.js
+const APP_VERSION = 'v218'; // keep in sync with the CACHE name in sw.js
 
 let base = null, info = null, ws = null, authed = false, failures = 0;
 let windowReady = false;
@@ -20,6 +20,7 @@ let frame = { w: 1000, h: 800 }, panel = null, zoom = 1;
 let windows = [], currentWindow = null, appPlans = {};
 let currentApp = null;
 let editorBrowsing = false, editorDirectory = null, returnToEditor = null;
+let docsRequest = 0, docsPending = null;
 const agentLists = new Map();
 try {
   for (const [k, v] of Object.entries(JSON.parse(store.get('agentLists') || '{}') || {})) if (Array.isArray(v)) agentLists.set(k, v);
@@ -41,9 +42,13 @@ function receiveAgents(m) {
   if (m.app && m.app !== currentApp) return;
   const key = agentListKey();
   const previous = agentLists.get(key) || [];
-  const titles = new Map(previous.map(a => [a.id, a.title]));
+  const previousById = new Map(previous.map(a => [a.id, a]));
   let list = m.list || [];
-  list = list.map(a => ({ ...a, title: a.title || titles.get(a.id) || '未命名会话' }));
+  list = list.map(a => {
+    const old = previousById.get(a.id);
+    const running = old && !Object.hasOwn(a, 'running') && Object.hasOwn(old, 'running') ? { running: old.running } : {};
+    return { ...a, ...running, title: a.title || old?.title || '未命名会话' };
+  });
   if (m.partial) {
     const remaining = (agentLists.get(key) || []).filter(a => String(a.id).startsWith('pick:'));
     list = [...list, ...remaining.filter(a => !list.some(b => b.title === a.title))];
@@ -193,6 +198,11 @@ function send(obj) {
     if (name) $('titleText').textContent = name + '…';
   }
   if (obj.t === 'openMenu') obj.requestId = ++menuRequest;
+  if (obj.t === 'docs') {
+    obj.requestId = ++docsRequest;
+    docsPending = { id: obj.requestId, sel: viewSel, computer: currentComputer()?.id || '' };
+    editorBrowsing = obj.editor === true;
+  }
   if (currentApp === 'codex' && ['settings', 'codexSetting', 'codexInstructions'].includes(obj.t)) obj.requestId = ++codexSettingsRequest;
   if (ws && ws.readyState === 1 && authed) ws.send(JSON.stringify(obj));
   else status('未连接', false);
