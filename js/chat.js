@@ -98,6 +98,14 @@ function thinkingWantOpen(it) {
   if (thinkingPref.has(key)) return thinkingPref.get(key);
   return true;
 }
+function readThinkingScroll(box) {
+  const state = box._thinkingScroll, top = box.scrollTop;
+  if (!box.hidden) {
+    if (top < state.top) state.follow = false;
+    else if (top > state.top && box.scrollHeight - box.clientHeight - top <= 1) state.follow = true;
+  }
+  state.top = top;
+}
 function paintThinking(el, it) {
   const open = thinkingWantOpen(it);
   el.classList.toggle('live', !!it.live);
@@ -112,12 +120,15 @@ function paintThinking(el, it) {
     el.innerHTML = `<button type="button" class="thbtn" data-think="">${it.src === 'devin' ? ICON.brain : ''}<span class="tht"></span><span class="tha"></span></button><div class="thb"></div>`;
     btn = el.querySelector('.thbtn');
     box = el.querySelector('.thb');
+    box._thinkingScroll = { follow: true, top: box.scrollTop };
+    box.addEventListener('scroll', () => readThinkingScroll(box), { passive: true });
   }
   btn.dataset.think = rest || more ? it.i : '';
   btn.dataset.more = more ? '1' : '';
   btn.querySelector('.tht').textContent = thinkingTitle(it.t);
   btn.querySelector('.tha').textContent = rest || more ? (open ? '收起' : '展开') : '';
-  const follow = open && it.live && box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  readThinkingScroll(box);
+  const follow = box._thinkingScroll.follow;
   const loading = more && thoughtFull.has(it.i) && full === undefined;
   const body = loading ? '加载中…' : more && full === null ? '内容未保存' : rest;
   box.classList.toggle('loading', loading);
@@ -125,6 +136,8 @@ function paintThinking(el, it) {
   box.hidden = !open;
   if (open && more && !thoughtFull.has(it.i)) thoughtObserver.observe(el);
   if (open && it.live && follow) box.scrollTop = box.scrollHeight;
+  // Scroll events arrive later; record our own positioning without changing follow state.
+  box._thinkingScroll.top = box.scrollTop;
 }
 
 // Rich tool rows (Devin transcript): icon + bold label + optional chips / duration /
@@ -189,6 +202,22 @@ function tasksHtml(it) {
   const list = (it.items || []).map(x => `<li class="${esc(x.status)}"><span class="ti">${TASK_ICON[x.status] || '○'}</span><span class="tt">${esc(x.t)}</span></li>`).join('');
   return `<div class="tprog"><i style="width:${pct}%"></i></div>` + (list ? `<ul class="tlist">${list}</ul>` : '');
 }
+const codexAutoRetryDone = new Map();
+function codexRetryKey(it) { return `${viewSel}|${it.btnItem || it.i}`; }
+function maybeAutoRetry(it) {
+  if (currentApp !== 'codex' || !codexAutoRetryEnabled()) return;
+  const n = (it.b || []).findIndex(label => /^(Retry|重试)$/i.test(label));
+  if (n < 0) return;
+  const key = codexRetryKey(it), count = codexAutoRetryDone.get(key) || 0, max = codexAutoRetryCount();
+  if (count >= max) return;
+  codexAutoRetryDone.set(key, count + 1);
+  const sel = viewSel;
+  setTimeout(() => {
+    if (currentApp !== 'codex' || viewSel !== sel) return;
+    send({ t: 'click', item: it.btnItem || it.i, n, actionId: it.actions?.[n] || '', label: it.b[n], sel });
+    status(`正在自动重试…（${count + 1}/${max}）`);
+  }, 0);
+}
 function renderItem(it) {
   const el = document.createElement('div');
   el.className = 'msg ' + it.k;
@@ -205,8 +234,13 @@ function renderItem(it) {
   }
   // it.h comes from the whitelist sanitizer in server/page/common.js (clean): plain tags only, text escaped.
   else if (it.k === 'assistant') { el.copyText = it.t || ''; el.innerHTML = it.h || ''; dressMessage(el); }
-  else if (it.k === 'thinking') paintThinking(el, it);
+  else if (it.k === 'thinking') {
+    const lines = String(it.t || '').split('\n');
+    el.copyText = lines.length > 1 ? lines.slice(1).join('\n') : (it.t || '');
+    paintThinking(el, it);
+  }
   else if (it.k === 'tool') {
+    el.copyText = it.t || '';
     if (it.kind && (it.src === 'devin' || it.src === 'codex')) { renderTool(el, it); el.classList.add('toolrow'); if (it.kind !== 'command') el.classList.add('open'); }
     else {
       el.innerHTML = `<div class="txt">${esc(it.t || '')}</div>`;
@@ -230,6 +264,7 @@ function renderItem(it) {
     });
   }
   if (it.b && it.k !== 'human') el.insertAdjacentHTML('beforeend', `<div class="btns">${buttonsHtml(it.b, it.btnItem || it.i, it.actions)}</div>`);
+  if (it.b && it.k !== 'human') maybeAutoRetry(it);
   if (it.k !== 'human') addImageCopyButtons(el);
   return el;
 }
