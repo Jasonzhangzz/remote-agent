@@ -3,8 +3,9 @@ let sheetKind = null;
 let menuRefreshTimer = 0;
 let menuPending = null, menuPickRequest = 0, modelSwitchRequest = null;
 function finishModelPick(m) {
-  if (m.sel !== viewSel || m.requestId !== modelSwitchRequest?.requestId) return;
+  if (!modelSwitchRequest || m.requestId !== modelSwitchRequest.requestId) return;
   modelSwitchRequest = null;
+  if (m.sel !== viewSel) return;
   if (m.kind === 'fast') {
     $('sheet').querySelectorAll('[data-fast]').forEach(button => { button.disabled = false; button.removeAttribute('aria-busy'); button.querySelector('[data-fast-pending]')?.remove(); });
     return;
@@ -21,19 +22,19 @@ let sharedAgentLibrary = { computer: '', records: {} };
 let pendingAgentFavorite = null;
 let agentActionRequest = 0;
 let pendingAgentActions = null;
+let agentActionTarget = null;
 let agentBatch = null;
 function batchActive() { return agentBatch?.key === agentListKey(); }
 function receiveSessionBatch(m) {
-  if (!batchActive() || m.app !== currentApp || m.requestId !== agentBatch.requestId) return;
+  if (!agentBatch || m.requestId !== agentBatch.requestId) return;
   agentBatch.progress = m;
   agentBatch.running = !m.done;
   for (const row of m.results) if (row.ok) agentBatch.selected.delete(row.id);
-  if (sheetKind === 'agents') renderAgentList();
+  if (sheetKind === 'agents' && batchActive()) renderAgentList();
 }
 function interruptSessionBatch() {
   if (!agentBatch?.running) return;
   agentBatch.running = false;
-  agentBatch.requestId = null;
   agentBatch.selected.clear();
   agentBatch.progress = { ...agentBatch.progress, results: agentBatch.progress?.results || [], total: agentBatch.progress?.total || 0, done: true };
   agentLists.delete(agentBatch.key);
@@ -87,18 +88,33 @@ function legacyAgentLibrary() {
   }
   return [...entries.values()];
 }
-function sharedAgentRecord(id) {
+function sharedAgentRecord(id, app = currentApp) {
   return sharedAgentLibrary.computer === currentComputer()?.id
-    ? sharedAgentLibrary.records[currentApp]?.[agentThreadKey({ id })] || {} : {};
+    ? sharedAgentLibrary.records[app]?.[agentThreadKey({ id }, app)] || {} : {};
+}
+function agentSessionAvailable(row, app = currentApp) {
+  const state = sharedAgentRecord(row.id, app);
+  return row.ui || !state.archived && !state.deleted;
 }
 function receiveSessionLibrary(message) {
   if (message.computer !== currentComputer()?.id) return;
   sharedAgentLibrary = message;
+  for (const app of ['cursor', 'devin', 'codex']) {
+    const prefix = currentComputer().key + ':' + app;
+    for (const [key, list] of [...agentLists]) {
+      if (key !== prefix && !key.startsWith(prefix + ':')) continue;
+      const available = list.filter(row => agentSessionAvailable(row, app));
+      if (available.length !== list.length) setAgentList(key, available);
+    }
+  }
   if (pendingAgentFavorite && message.records[pendingAgentFavorite.app]?.[agentThreadKey({ id: pendingAgentFavorite.id }, pendingAgentFavorite.app)]?.favorite === pendingAgentFavorite.on) {
     status(pendingAgentFavorite.on ? '已设为常用' : '已取消常用');
     pendingAgentFavorite = null;
   }
   if (sheetKind === 'agents') renderAgentList();
+  const here = currentComputer();
+  if (windowReady && !navigationPending && !agentSessionAvailable({ id: here.threadId }))
+    send({ t: 'attach', id: here.win, windowId: here.windowId, threadId: '' });
 }
 function receiveSessionChange(message) {
   if (message.computer !== currentComputer()?.id) return;
@@ -113,16 +129,19 @@ function receiveSessionChange(message) {
   if (message.action !== 'rename' && currentApp === message.app && here.threadId === message.id)
     send({ t: 'attach', id: here.win, windowId: here.windowId, threadId: '' });
 }
+function agentSessionCommon(record) {
+  const lastMessageAt = Number(record.lastMessageAt) || 0;
+  const ageDays = lastMessageAt > 0 && lastMessageAt <= Date.now() ? (Date.now() - lastMessageAt) / 86400000 : Infinity;
+  return record.favorite === true || (lastMessageAt > 0 && ageDays <= 7);
+}
 function agentUsageInfo(a) {
   const thread = agentThreadKey(a);
   const saved = { ...(agentUsage[agentUsageKey(thread)] || {}), ...(agentUsage[agentUsageKey(a.id)] || {}) };
   const opened = agentOpened[agentOpenedKey(thread)] || 0;
   const lastUsed = Math.max(Number(a.lastUsed) || 0, Number(saved.last) || 0, opened);
   const shared = sharedAgentRecord(a.id);
-  const lastMessageAt = Number(shared.lastMessageAt) || 0;
-  const ageDays = lastMessageAt > 0 && lastMessageAt <= Date.now() ? (Date.now() - lastMessageAt) / 86400000 : Infinity;
   const favorite = shared.favorite === true;
-  return { ...a, ...(shared.title && !a.ui ? { title: shared.title } : {}), lastUsed, favorite, common: favorite || (lastMessageAt > 0 && ageDays <= 7) };
+  return { ...a, ...(shared.title && !a.ui ? { title: shared.title } : {}), lastUsed, favorite, common: agentSessionCommon(shared) };
 }
 function agentFavoriteState(id) {
   return sharedAgentRecord(id).favorite === true;
@@ -145,7 +164,9 @@ function rememberChatMessageTime(chat) {
 }
 function rememberAgentOpen(m) {
   const target = /^(?:thread|win|new):([^:]+)(?::(.+))?$/.exec(pendingAgentOpen);
-  const matched = m.app === 'codex' ? target && m.windowId === target[1] && (!target[2] || m.threadId === target[2]) : pendingAgentOpen === m.threadId;
+  const matched = pendingAgentOpen.startsWith('thread:')
+    ? agentThreadKey({ id: pendingAgentOpen }, m.app) === m.threadId
+    : m.app === 'codex' ? target && m.windowId === target[1] && (!target[2] || m.threadId === target[2]) : pendingAgentOpen === m.threadId;
   if (!m.closed && pendingAgentOpen && matched && m.threadId) {
     const now = Date.now(), openedKey = agentOpenedKey(m.threadId), usageKey = agentUsageKey(m.threadId);
     agentOpened[openedKey] = now;
@@ -195,6 +216,7 @@ function openSheet(kind, html) {
 }
 function closeSheet() {
   askDone?.(false);
+  agentActionTarget = null;
   pendingProjectReveal = null;
   cancelDocs();
   clearTimeout(menuRefreshTimer);
@@ -317,6 +339,7 @@ function paintRail() {
   const rail = $('rail');
   if (!rail) return;
   const { entries, missingAgents } = windowEntries();
+  entries.sort((a, b) => (a.app === 'fusion') - (b.app === 'fusion') || a.app.localeCompare(b.app));
   const collapsed = railCollapsed();
   const sig = JSON.stringify([currentApp, mode, I18N.lang, currentComputer()?.name || '', $('dot').className, collapsed,
     entries.map(w => [w.id, w.app, appPlans[w.app] || '']), missingAgents]);
@@ -344,7 +367,7 @@ function paintRail() {
   const icRail = ic('<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/>');
   const toggleLabel = collapsed ? '展开侧栏' : '收起侧栏';
   rail.innerHTML = `
-    <div class="railComputer"><img src="logo.png" alt=""><span class="railComputerName">${esc(currentComputer()?.name || 'Remote Agent')}</span><span class="railDot${$('dot').classList.contains('ok') ? ' ok' : ''}"></span><button class="railToggle" data-rail="toggle" title="${I18N.tr(toggleLabel)}" aria-label="${I18N.tr(toggleLabel)}">${icRail}</button></div>
+    <div class="railComputer"><img src="logo.png" alt=""><button class="railComputerName" data-rail="computers" title="${esc(I18N.tr('切换电脑'))}">${esc(currentComputer()?.name || 'Remote Agent')}</button><span class="railDot${$('dot').classList.contains('ok') ? ' ok' : ''}"></span><button class="railToggle" data-rail="toggle" title="${I18N.tr(toggleLabel)}" aria-label="${I18N.tr(toggleLabel)}">${icRail}</button></div>
     <div class="pSec">Agent</div>
     ${agentRows}
     <div class="pSec">${I18N.tr('工作区')}</div>
@@ -366,6 +389,7 @@ $('rail')?.addEventListener('click', e => {
   if (b.dataset.win) return switchToWindow(b.dataset.win);
   const act = b.dataset.rail;
   if (act === 'windows') { send({ t: 'windows' }); showWindows(); }
+  else if (act === 'computers') showComputers();
   else if (act === 'agents') openAgentList();
   else if (act === 'editor') startEditor();
   else if (act === 'mode-chat') setMode('chat');
@@ -585,24 +609,40 @@ function foldSection(name, inner, open, count, key) {
 function agentFilterSlider(filters) {
   return `<div class="agentSessionFilter${filters.session === 'common' ? ' common' : ''}" role="group" aria-label="会话筛选">${Object.entries(agentFilterLabels).map(([value, text]) => `<button type="button" aria-pressed="${filters.session === value}" data-agent-filter-value="${value}">${text}</button>`).join('')}</div>`;
 }
-function showAgentActions(id, title, actions = null) {
-  const current = (agentLists.get(agentListKey()) || []).find(a => a.id === id);
-  const codexThread = currentAppName === 'Codex' && String(id).startsWith('thread:');
-  const favorite = agentFavoriteState(id);
+function showAgentActions(id, title, actions = null, target = null) {
+  agentActionTarget = target;
+  const current = !target && (agentLists.get(agentListKey()) || []).find(a => a.id === id);
+  const codexThread = (target ? target.app === 'codex' : currentAppName === 'Codex') && String(id).startsWith('thread:');
+  const favorite = target ? target.favorite : agentFavoriteState(id);
+  const disabled = target?.off ? ' disabled' : '';
+  const nativeDisabled = target?.off || target?.dormant ? ' disabled' : '';
   const rows = [
-    current?.current ? '' : `<button class="opt" data-agent-action="open" data-agent-action-id="${esc(id)}" data-agent-action-title="${esc(title)}"><span class="lbl">打开会话</span></button>`,
-    `<button class="opt" data-agent-action="favorite" data-agent-action-id="${esc(id)}"><span class="lbl">${favorite ? '取消常用' : '设置为常用'}</span></button>`,
-    ...(actions || (codexThread ? ['rename', 'archive'] : [])).map(action => `<button class="opt" data-agent-action="${action}" data-agent-action-id="${esc(id)}" data-agent-action-title="${esc(title)}"><span class="lbl">${action === 'rename' ? '重命名' : action === 'delete' ? '删除' : codexThread ? '删除／归档' : '归档'}</span></button>`),
-    actions === null && !codexThread ? '<div class="hint">正在读取会话操作…</div>' : '',
+    current?.current ? '' : `<button class="opt" data-agent-action="open" data-agent-action-id="${esc(id)}" data-agent-action-title="${esc(title)}"${target?.dormant && !target.workspace ? ' disabled' : ''}><span class="lbl">打开会话</span></button>`,
+    `<button class="opt" data-agent-action="favorite" data-agent-action-id="${esc(id)}"${disabled}><span class="lbl">${target ? favorite ? '取消收藏' : '收藏' : favorite ? '取消常用' : '设置为常用'}</span></button>`,
+    ...(actions || (codexThread ? ['rename', 'archive'] : [])).map(action => `<button class="opt" data-agent-action="${action}" data-agent-action-id="${esc(id)}" data-agent-action-title="${esc(title)}"${nativeDisabled}><span class="lbl">${action === 'rename' ? '重命名' : action === 'delete' ? '删除' : codexThread ? '删除／归档' : '归档'}</span></button>`),
+    target?.off ? '<div class="hint">电脑离线，连接后可管理会话</div>' : target?.dormant ? '<div class="hint">项目窗口已关闭，打开对话后可重命名或归档／删除</div>' : actions === null && !codexThread ? '<div class="hint">正在读取会话操作…</div>' : '',
   ].filter(Boolean).join('');
-  openSheet('agent-actions', `<h3>${esc(title)}</h3>${rows || '<div class="hint">没有可用操作。</div>'}`);
-  if (actions === null && !codexThread) {
+  const owner = target ? `<div class="hint">${esc(ovCompName(target.comp))} · ${esc(target.projName)} · ${esc(ovAgName(target))}</div>` : '';
+  openSheet('agent-actions', `<h3>${esc(title)}</h3>${owner}${rows || '<div class="hint">没有可用操作。</div>'}`);
+  if (actions === null && !codexThread && !target?.off && !target?.dormant) {
+    if (target) {
+      const requestId = ++agentActionRequest;
+      const active = () => sheetKind === 'agent-actions' && agentActionTarget === target && agentActionRequest === requestId;
+      ovSessionRequest(target, 'actions').then(message => {
+        if (active()) showAgentActions(id, title, message.actions, target);
+      }).catch(error => {
+        if (!active()) return;
+        showAgentActions(id, title, [], target);
+        $('sheet').insertAdjacentHTML('beforeend', `<div class="hint">${esc(error.message)}</div>`);
+      });
+      return;
+    }
     pendingAgentActions = { id, title, requestId: ++agentActionRequest };
     send({ t: 'sessionActions', id, requestId: agentActionRequest });
   }
 }
 function receiveAgentActions(message) {
-  if (sheetKind !== 'agent-actions' || message.app !== currentApp || message.requestId !== agentActionRequest) return;
+  if (agentActionTarget || sheetKind !== 'agent-actions' || message.app !== currentApp || message.requestId !== agentActionRequest) return;
   if (pendingAgentActions?.id === message.id) showAgentActions(message.id, pendingAgentActions.title, message.actions);
 }
 function renderAgentList() {
@@ -676,6 +716,13 @@ function showAgents(list) {
 $('sheet').addEventListener('click', async e => {
   const b = e.target.closest('button');
   if (!b) return;
+  if (sheetKind === 'main' && b.dataset.startView) {
+    store.set('start-view', b.dataset.startView);
+    const slider = b.closest('.agentSessionFilter');
+    slider.classList.toggle('common', b.dataset.startView === 'conversation');
+    slider.querySelectorAll('[data-start-view]').forEach(option => option.setAttribute('aria-pressed', String(option === b)));
+    return;
+  }
   if (sheetKind === 'project-windows') {
     const change = { ...(b.dataset.windowKey ? { window: b.dataset.windowKey } : {}) };
     for (const field of ['enabled', 'owned', 'keep']) if (b.hasAttribute('data-window-' + field)) change[field] = b.getAttribute('data-window-' + field) === '1';
@@ -1172,6 +1219,20 @@ $('sheet').addEventListener('change', e => {
   store.set('agent-start:' + agentComputerKey(), JSON.stringify([...selected]));
   showAgentManager();
 });
+let connectionDetailsComputer = '';
+function showConnectionDetails(id) {
+  const e = ovList.find(e => e.id === id);
+  if (!e?.c) return;
+  connectionDetailsComputer = id;
+  const state = ovStOf(id), tr = I18N.tr, failure = state.failure;
+  const checks = (state.checks || []).map(c => `<div class="connection-check"><span>${esc(tr(c.label))}</span><span class="${c.st}">${esc(tr(DIAG_TEXT[c.st]))}</span></div>`).join('');
+  const technical = [failure?.stage, failure?.error, ...(state.checks || []).filter(c => c.st === 'err').map(c => tr(c.label) + '：' + diagReason(c))].filter(Boolean).join('\n');
+  openSheet('connection-details', `<h3>连接详情</h3><p class="hint ovRaw">${esc(e.name)}</p>
+    <p class="hint">${esc(tr(state.diagRunning ? '正在检测连接…' : state.conclusion || '连接未建立，请重试。'))}</p>
+    ${checks}${technical ? `<pre class="connection-technical">${esc(technical)}</pre>` : ''}
+    <div class="optRow"><button class="opt" data-act="connectionRetry" data-computer="${esc(id)}">重新连接</button><button class="opt" data-act="connectionDiagnose" data-computer="${esc(id)}" ${state.diagRunning ? 'disabled' : ''}>重新检测</button></div>`);
+}
+
 function showAgentManager(refresh = false) {
   if (refresh) {
     send({ t: 'connAgents' });
@@ -1197,10 +1258,13 @@ function showAgentManager(refresh = false) {
 
 let usageTimer = null;
 function showMainMenu() {
+  const startConversation = store.get('start-view') === 'conversation';
+  const entryItem = `<div class="opt"><span class="lbl">默认进入<span class="sub">下次打开或刷新生效</span></span><div class="agentSessionFilter${startConversation ? ' common' : ''}" style="width:176px;max-width:70%;margin:0" role="group" aria-label="${esc(I18N.tr('默认进入'))}"><button type="button" data-start-view="overview" aria-pressed="${!startConversation}" style="padding:4px 2px">${I18N.tr('缩略图')}</button><button type="button" data-start-view="conversation" aria-pressed="${startConversation}" style="padding:4px 2px">${I18N.tr('会话内容')}</button></div></div>`;
+  const manageItem = !document.body.classList.contains('conv') && ovS.level !== 'projects'
+    ? '<button class="opt" data-act="overviewBatch"><span class="lbl">批量管理会话</span></button>' : '';
   const notifyItem = `<button class="opt" id="notifySwitchRow" data-act="notifyToggle" role="switch" aria-checked="${notifyOn}"><span class="lbl">开启通知<span class="sub">Agent 完成或等你确认时提醒</span></span><span class="switch${notifyOn ? ' on' : ''}" aria-hidden="true"></span></button>`;
-  const partialOn = connAutoPartialOn(), autoLaunchOn = store.get('conn-auto-launch') === '1';
-  const connItems = `<button class="opt" id="menuPartialRow" data-act="connPartialToggle" role="switch" aria-checked="${partialOn}"><span class="lbl">部分失败时直接进入<span class="sub">连接电脑时，只要有一个 Agent 可用就自动进入</span></span><span class="switch${partialOn ? ' on' : ''}" aria-hidden="true"></span></button>`
-    + `<button class="opt" id="menuLaunchRow" data-act="connLaunchToggle" role="switch" aria-checked="${autoLaunchOn}"><span class="lbl">自动启动未打开的 Agent<span class="sub">连接电脑时自动启动没有运行的 Agent</span></span><span class="switch${autoLaunchOn ? ' on' : ''}" aria-hidden="true"></span></button>`;
+  const autoLaunchOn = store.get('conn-auto-launch') === '1';
+  const connItems = `<button class="opt" id="menuLaunchRow" data-act="connLaunchToggle" role="switch" aria-checked="${autoLaunchOn}"><span class="lbl">自动启动未打开的 Agent<span class="sub">连接电脑时自动启动没有运行的 Agent</span></span><span class="switch${autoLaunchOn ? ' on' : ''}" aria-hidden="true"></span></button>`;
   const update = apkUpdate()
     ? `<button class="opt" data-act="appUpdate"><span class="lbl">更新安卓 App（v${esc(appVersion)} → v${esc(apkUpdate())}）</span><span class="tag">新</span></button>`
     : `<button class="opt" data-act="appUpdate"><span class="lbl">检查 App 更新（当前 v${esc(appVersion)}）</span></button>`;
@@ -1210,7 +1274,7 @@ function showMainMenu() {
     ${currentApp === 'cursor' && lastChat?.mode ? `<button class="opt" data-act="mode"><span class="lbl">${I18N.tr('模式')}<span class="sub">${esc(lastChat.mode === 'Bypass Permissions' ? '⚠ 绕过权限' : lastChat.mode)}</span></span></button>` : ''}
     ${lastChat?.permission || (currentApp === 'devin' && lastChat?.mode) ? `<button class="opt" data-act="permission"><span class="lbl">权限模式<span class="sub">${esc(lastChat.permission || lastChat.mode)}</span></span></button>` : ''}
     <button class="opt" data-act="screen"><span class="lbl">画面<span class="sub">查看绘图与仿真窗口</span></span></button>
-    ${currentApp === 'codex' ? '<button class="opt" data-act="codexResetHelp"><span class="lbl">Codex 额度重置</span></button><button class="opt" data-act="codexRetryMenu"><span class="lbl">Codex 自动重试<span class="sub">' + (codexAutoRetryEnabled() ? `已开启 · 最多 ${codexAutoRetryCount()} 次` : '已关闭') + '</span></span><span class="tag">›</span></button>' : ''}
+    ${currentApp === 'codex' ? '<button class="opt" data-act="codexRetryMenu"><span class="lbl">Codex 自动重试<span class="sub">' + (codexAutoRetryEnabled() ? `已开启 · 最多 ${codexAutoRetryCount()} 次` : '已关闭') + '</span></span><span class="tag">›</span></button>' : ''}
     ${supportsCapability('settings') ? '<button class="opt" data-act="settings"><span class="lbl">设置</span></button>' : ''}
     ${['cursor', 'devin', 'codex', 'fusion'].includes(currentApp) ? `<button class="opt" data-act="executionToggle" role="switch" aria-checked="${executionRecordsShown()}"><span class="lbl">显示执行指令<span class="sub">包含工具读取和搜索记录；关闭后在本轮结束时隐藏</span></span><span class="switch${executionRecordsShown() ? ' on' : ''}" aria-hidden="true"></span></button>` : ''}
     ${lastChat?.changed && !lastChat?.readonly ? `<button class="opt" data-act="toggleChanges"><span class="lbl">${hiddenChangeNotices.has(changeNoticeKey()) ? '显示改动' : '隐藏改动提示'}</span></button>` : ''}`;
@@ -1228,9 +1292,9 @@ function showMainMenu() {
     ${inApp && window.AgentRemoteApp?.listenStatus ? '<button class="opt" data-act="bg"><span class="lbl">后台连接<span class="sub">状态、电池优化、立即重连</span></span></button>' : ''}
     <button class="opt" data-act="cache"><span class="lbl">会话缓存<span class="sub">手机上保存的对话记录，可折叠、可清除</span></span></button>
     <button class="opt" data-act="lang"><span class="lbl">语言 / Language<span class="sub">中文 · English（${I18N.lang === 'en' ? 'English' : '中文'}）</span></span></button>`;
-  openSheet('main', `<div class="mainMenuHeader"><h3>菜单</h3><div class="mainMenuActions"><button class="menuHeaderAction" data-act="transfer" aria-label="${esc(I18N.tr('文件传输'))}" title="${esc(I18N.tr('文件传输'))}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 16V4m0 0L3 8m4-4 4 4M17 8v12m0 0 4-4m-4 4-4-4"/></svg></button><button class="menuHeaderAction" data-act="localVoiceMenu" aria-label="${esc(I18N.tr('语音输入'))}" title="${esc(I18N.tr('语音输入'))}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button><button class="menuHeaderAction menuComputer" data-act="computers" aria-label="${esc(I18N.tr('电脑'))}" title="${esc(I18N.tr('电脑'))}">${CONN_HOST_SVG}</button></div></div>${menuGroup('model', '模型', (appName ? `<div class="pSec">${esc(appName)}</div>` : '') + modelItems)}
+  openSheet('main', `<div class="mainMenuHeader"><h3>菜单</h3><div class="mainMenuActions"><button class="menuHeaderAction" data-act="transfer" aria-label="${esc(I18N.tr('文件传输'))}" title="${esc(I18N.tr('文件传输'))}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 16V4m0 0L3 8m4-4 4 4M17 8v12m0 0 4-4m-4 4-4-4"/></svg></button><button class="menuHeaderAction" data-act="localVoiceMenu" aria-label="${esc(I18N.tr('语音输入'))}" title="${esc(I18N.tr('语音输入'))}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button><button class="menuHeaderAction menuComputer" data-act="computers" aria-label="${esc(I18N.tr('电脑'))}" title="${esc(I18N.tr('电脑'))}">${CONN_HOST_SVG}</button></div></div>${entryItem}${manageItem}${document.body.classList.contains('conv') ? menuGroup('model', '模型', (appName ? `<div class="pSec">${esc(appName)}</div>` : '') + modelItems) : ''}
     ${menuGroup('general', '通用', menuGroup('connection', 'Agent 与连接', connectionItems, false)
-      + menuGroup('settings', '应用设置与帮助', settingsItems, false))}`);
+      + menuGroup('settings', '应用设置与帮助', settingsItems, false))}<p class="hint">网页版本 ${esc(APP_VERSION)}</p>`);
 }
 $('menuBtn').onclick = showMainMenu;
 

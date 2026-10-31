@@ -34,6 +34,31 @@ const scReq = (mode, fn) => scDb().then(db => new Promise((res, rej) => {
 })).catch(() => null);
 const idbGet = k => scReq('readonly', s => s.get(k));
 const idbPut = (k, v) => scTrackWrite(k, scReq('readwrite', s => s.put(v, k)));
+const computerResumes = new Map();
+const computerResumeReady = idbGet('computer-resumes').then(saved => {
+  for (const [id, value] of saved?.entries || []) {
+    if (loadComputers().some(c => c.id === id)) computerResumes.set(id, value);
+  }
+  if (saved && Date.now() - saved.at < 5 * 60 * 1000) ovRestoreComputers(saved);
+});
+function saveComputerResume(link) {
+  if (computerSockets.get(link.computer.key) !== link || !link.auth?.resumeId || !computerBindingReady(link)) return;
+  const foreground = link.socket === ws && !!link.receive;
+  const { chat, ...binding } = link.binding;
+  computerResumes.set(link.expectedId, {
+    resumeId: link.auth.resumeId, binding,
+    overview: ovSt.get(link.expectedId)?.data,
+    offset: ovSt.get(link.expectedId)?.offset || 0,
+  });
+  if (!foreground) cacheChat(binding.sel, chat, link.expectedId);
+  return saveComputerResumes();
+}
+function saveComputerResumes() {
+  const ids = new Set(loadComputers().map(c => c.id));
+  for (const id of computerResumes.keys()) if (!ids.has(id)) computerResumes.delete(id);
+  for (const [id, value] of computerResumes) value.folded = !!ovSt.get(id)?.folded && ovCollapsed.has(id);
+  return idbPut('computer-resumes', { at: Date.now(), entries: [...computerResumes], view: ovHistory() });
+}
 const chatCacheKey = sel => `${currentComputer()?.id || ''}|${sel}`;
 const chatPreviewGeneration = scGeneration, chatPreviewVersions = new Map(scVersions);
 const chatPreviewReady = idbGet('chat-previews').then(entries => {
@@ -50,8 +75,8 @@ function chatTail(items, limit) {
   const head = items.slice(0, start).findLast(it => it.k === 'human');
   return [...(head ? [head] : []), ...items.slice(start)];
 }
-function cacheChat(sel, chat) {
-  const key = chatCacheKey(sel);
+function cacheChat(sel, chat, computer = currentComputer()?.id || '') {
+  const key = `${computer}|${sel}`;
   lruPut(chatBySel, key, chat, 12);
   if (key === SC.key) SC.cleared = false;
   saveChatPreview();
@@ -636,6 +661,7 @@ function renderChat(chat, stale, loading = false, keepReading = true, historyIns
   rememberChatMessageTime(chat);
   pruneEchoes(chat);
   updateGenerationTime(chat, stale);
+  const previousStale = chatStale;
   chatStale = !!stale;
   if (chat?.items?.some(it => it.k === 'human')) $('sessionNotice').hidden = true;
   rememberInputHistory(chat);
@@ -652,12 +678,26 @@ function renderChat(chat, stale, loading = false, keepReading = true, historyIns
     $('older').disabled = false;
     $('historyStatus').hidden = true;
   }
+  if (chat && !historyExpanded && Number.isFinite(chat.historyBefore)) historyCursor = chat.historyBefore;
   if (chat?.earlier === true && (currentApp !== 'codex' || !historyExpanded)) historyAtEnd = false;
-  if (chat && previous?.thread === chat.thread && historyExpanded && currentApp !== 'devin') {
-    const rows = historyRequest ? [...chat.items, ...previous.items] : [...previous.items, ...chat.items];
+  const paged = currentApp === 'codex' && Number.isFinite(chat?.historyBefore) && !stale && !previousStale;
+  if (chat && previous?.thread === chat.thread && (historyExpanded || paged) && currentApp !== 'devin') {
     const updates = new Map(chat.items.map(it => [it.i, it]));
-    const merged = [...new Map(rows.map(it => [it.i, updates.get(it.i) || it])).values()];
+    const bodies = previous.items.flatMap(item => {
+      if (updates.has(item.i)) return [updates.get(item.i)];
+      if (paged && item.syntheticCapacity && chat.capacityPresent === false) return [];
+      if (paged && item.capacity) { const { b, actions, btnItem, ...body } = item; return [body]; }
+      if (paged && !chat.busy && item.k === 'thinking' && item.live) return [{ ...item, live: false }];
+      return [item];
+    });
+    const rows = historyRequest ? [...chat.items, ...bodies] : [...bodies, ...chat.items];
+    let merged = [...new Map(rows.map(it => [it.i, updates.get(it.i) || it])).values()];
     if (merged.every(it => Number.isFinite(it.order))) merged.sort((a, b) => a.order - b.order);
+    if (paged && !historyExpanded) {
+      const keep = new Set(chatTail(merged, 400).map(item => String(item.i)));
+      if (!followingChat()) for (const el of itemsEl.children) keep.add(el.dataset.i);
+      merged = merged.filter(item => keep.has(String(item.i)));
+    }
     chat = { ...chat, items: merged };
   }
   if ((chatTouching || chatMomentum || chatScrolling || turnNavPointer?.dragging) && chat && previous?.thread === chat.thread) {
@@ -872,7 +912,12 @@ $('taskChip').onclick = () => showTasks();
 itemsEl.addEventListener('toggle', e => { const id = e.target.dataset.task; if (id) e.target.open ? taskOpen.add(id) : taskOpen.delete(id); }, true);
 $('qnBar').addEventListener('click', e => {
   const compose = e.target.closest('[data-question-compose]');
-  if (compose) { setQuestionCompose(compose.dataset.questionCompose); text.focus(); return; }
+  if (compose) {
+    setQuestionCompose(compose.dataset.questionCompose);
+    if (portraitComposer()) setComposerFold(false);
+    text.focus();
+    return;
+  }
   const b = e.target.closest('[data-action][data-request]');
   if (b) {
     const id = b.dataset.request, n = Number(b.dataset.action);
@@ -886,10 +931,12 @@ $('qnBar').addEventListener('click', e => {
 let qnSig = '', qnState = null, qnView = '', qnPending = null;
 const qnDrafts = new Map();
 const questionFieldKey = el => `${el.dataset.request}|${el.dataset.field}`;
+const questionCard = (head, body, open) => `<details class="qnCard" ${open ? 'open' : ''}><summary class="qnHead"><span class="qnHeading">${head}</span><svg class="arrowIcon qnFold" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary><div class="qnBody">${body}</div></details>`;
 function questionBusy() {
   const bar = $('qnBar');
   bar.setAttribute('aria-busy', String(!!qnPending));
   if (qnPending) bar.querySelectorAll('button,input,select').forEach(el => { el.disabled = true; });
+  updateComposeCompact();
 }
 function sendQuestion(message) {
   if (qnPending) return;
@@ -904,28 +951,10 @@ function setQuestionCompose(id) {
   if (questionCompose?.id === id && questionCompose.sel === viewSel || !questionCompose && !id) return;
   if (mode !== 'chat') { questionCompose = id ? { id, sel: viewSel } : null; updateAppText(); updateSendMode(); return; }
   saveDraft();
-  const carry = !questionCompose && mode === 'chat' ? text.value : '';
   questionCompose = id ? { id, sel: viewSel } : null;
   restoreDraft();
-  if (id && !drafts.has(activeDraft)) {
-    text.value = qnDrafts.get(`${id}|0`) ?? qnState?.requests?.find(r => r.id === id)?.fields[0]?.value ?? '';
-    if (!text.value) text.value = carry;
-    syncQuestionDraft(text.value);
-    autosize(); saveDraft();
-  }
   updateAppText();
   updateSendMode();
-}
-function syncQuestionDraft(value) {
-  if (mode !== 'chat' || questionCompose?.sel !== viewSel) return;
-  qnDrafts.set(`${questionCompose.id}|0`, value);
-  const field = [...$('qnBar').querySelectorAll('[data-field="0"]')].find(el => el.dataset.request === questionCompose.id);
-  if (field) {
-    field.value = value;
-    const request = qnState?.requests?.find(r => r.id === questionCompose.id);
-    const submit = [...$('qnBar').querySelectorAll('[data-action]')].find(el => el.dataset.request === questionCompose.id && Number(el.dataset.action) === request.buttons.length - 1);
-    if (submit) submit.disabled = !!qnPending || request.buttons.every(b => b.disabled) || !value.trim();
-  }
 }
 function submitQuestionCompose() {
   const request = qnState?.requests?.find(r => r.id === questionCompose?.id);
@@ -965,6 +994,10 @@ function finishQuestion(m) {
 function renderQuestions(qs) {
   const bar = $('qnBar');
   if (qs?.codex && currentApp !== 'codex') qs = null;
+  const keys = value => value?.codex ? value.requests.map(r => r.id)
+    : (value?.list || []).map(q => JSON.stringify([!!value.devin, value.pager?.cur, q.text]));
+  const known = new Set(keys(qnState));
+  const open = qnView !== viewSel || keys(qs).some(key => !known.has(key)) || bar.querySelector('.qnCard')?.open !== false;
   if (qnView !== viewSel) { qnView = viewSel; qnSig = ''; qnPending = null; qnDrafts.clear(); }
   if (qnPending && (qnPending.message.id ? !qs?.requests?.some(r => r.id === qnPending.message.id) : !qs?.list?.length)) {
     qnPending = null;
@@ -982,15 +1015,15 @@ function renderQuestions(qs) {
     const focused = bar.contains(document.activeElement) ? document.activeElement : null;
     const focusKey = focused?.matches('[data-field]') ? questionFieldKey(focused) : null;
     const selection = focusKey ? [focused.selectionStart, focused.selectionEnd] : null;
-    const expanded = new Set([...bar.querySelectorAll('details[open]')].map(el => el.dataset.question));
-    bar.innerHTML = `<div class="qnHead">Codex 等待你${qs.requests.some(r => r.id.startsWith('approval:')) ? '审批' : '回答'}<span class="qnCount">${qs.requests.length} 个请求</span></div>` + qs.requests.map(r => {
+    const expanded = new Set([...bar.querySelectorAll('.qnDetails[open]')].map(el => el.dataset.question));
+    bar.innerHTML = questionCard(`Codex 等待你${qs.requests.some(r => r.id.startsWith('approval:')) ? '审批' : '回答'}<span class="qnCount">${qs.requests.length} 个请求</span>`, qs.requests.map(r => {
       const lines = r.text.trim().split('\n'), heading = lines.shift();
       const remaining = lines.join('\n').trim();
       return `<section class="qnRequest"><div class="qnQ">${esc(heading)}</div>`
       + (remaining ? `<details class="qnDetails" data-question="${esc(r.id)}" ${expanded.has(r.id) ? 'open' : ''}><summary>展开问题详情</summary>${esc(remaining)}</details>` : '')
       + (r.id.startsWith('async:') ? `<div class="qnOpts">${r.buttons.slice(0, -2).map((b, n) => `<button class="qnOpt ${b.selected ? 'on' : ''}" data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div>` : '')
       + r.fields.map((f, n) => `<label class="qnFree">${esc(f.label)}${f.options ? `<select data-request="${esc(r.id)}" data-field="${n}">${f.options.map(o => `<option value="${esc(o.value)}" ${o.value === f.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>` : `<input data-request="${esc(r.id)}" data-field="${n}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(f.value)}">`}</label>`).join('')
-      + `<div class="qnAct">${r.id.startsWith('async:') ? `<button data-question-compose="${esc(r.id)}">在对话框回答</button>` : ''}${r.buttons.map((b, n) => r.id.startsWith('async:') && n < r.buttons.length - 2 ? '' : `<button data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div></section>`; }).join('');
+      + `<div class="qnAct">${r.id.startsWith('async:') ? `<button data-question-compose="${esc(r.id)}">在对话框回答</button>` : ''}${r.buttons.map((b, n) => r.id.startsWith('async:') && n < r.buttons.length - 2 ? '' : `<button data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div></section>`; }).join(''), open);
     bar.classList.toggle('show', qs.requests.length > 0);
     bar.querySelectorAll('[data-field]').forEach(el => {
       const key = questionFieldKey(el);
@@ -998,16 +1031,11 @@ function renderQuestions(qs) {
       el.oninput = () => {
         qnDrafts.set(key, el.value);
         const r = qnState.requests.find(r => r.id === el.dataset.request);
-        if (r.id.startsWith('async:') && el.dataset.field === '0' && mode === 'chat' && document.activeElement === el) {
-          setQuestionCompose(r.id);
-          text.value = el.value; autosize(); saveDraft();
-        }
         if (r.id.startsWith('async:') && !r.buttons.every(b => b.disabled) && !qnPending) {
           const submit = [...bar.querySelectorAll('[data-action]')].find(b => b.dataset.request === r.id && Number(b.dataset.action) === r.buttons.length - 1);
           submit.disabled = !el.value.trim();
         }
       };
-      if (el.dataset.request.startsWith('async:') && el.dataset.field === '0') el.onfocus = () => setQuestionCompose(el.dataset.request);
       el.onchange = () => { if (!el.dataset.request.startsWith('async:')) send({ t: 'codexRequest', id: el.dataset.request, field: Number(el.dataset.field), value: el.value }); };
       if (qnDrafts.has(key)) el.oninput();
       if (key === focusKey && !qnPending) {
@@ -1019,28 +1047,28 @@ function renderQuestions(qs) {
     if (document.body.classList.contains('kb')) fitViewport();
     return;
   }
-  if (!qs?.list?.length) { bar.innerHTML = ''; bar.classList.remove('show'); return; }
+  if (!qs?.list?.length) { bar.innerHTML = ''; bar.classList.remove('show'); updateComposeCompact(); return; }
   if (qs.devin) {
     const q = qs.list[0], pg = qs.pager;
-    bar.innerHTML = `<div class="qnHead">Devin 在问你${pg ? `（${pg.cur}/${pg.total}）` : ''}`
-      + (pg && pg.total > 1 ? `<span class="qnPg"><button data-qpart="prev" ${qs.canPrev ? '' : 'disabled'}>‹</button><button data-qpart="next" ${qs.canNext ? '' : 'disabled'}>›</button></span>` : '') + '</div>'
+    bar.innerHTML = questionCard(`Devin 在问你<span class="qnCount">${pg ? `${pg.cur}/${pg.total}` : '1 个问题'}</span>`,
+      (pg && pg.total > 1 ? `<div class="qnPg"><button data-qpart="prev" ${qs.canPrev ? '' : 'disabled'}>‹</button><button data-qpart="next" ${qs.canNext ? '' : 'disabled'}>›</button></div>` : '')
       + `<div class="qnQ">${esc(q.text)}</div><div class="qnOpts">`
       + q.options.map((o, oi) => `<button class="qnOpt ${o.sel ? 'on' : ''}" data-qi="0" data-oi="${oi}"><b>${q.multi ? (o.sel ? '☑' : '☐') : String.fromCharCode(65 + oi)}</b><span>${esc(o.label)}${o.desc ? `<small>${esc(o.desc)}</small>` : ''}</span></button>`).join('')
       + `</div><div class="qnHint">想自己回答？直接在下方输入框写</div>`
-      + `<div class="qnAct"><button data-qpart="skip">跳过</button>${qs.hasSubmit ? `<button class="primary" data-qpart="submit" ${qs.canSubmit ? '' : 'disabled'}>提交</button>` : ''}</div>`;
+      + `<div class="qnAct"><button data-qpart="skip">跳过</button>${qs.hasSubmit ? `<button class="primary" data-qpart="submit" ${qs.canSubmit ? '' : 'disabled'}>提交</button>` : ''}</div>`, open);
     bar.classList.add('show');
     questionBusy();
     return;
   }
-  bar.innerHTML = `<div class="qnHead">Agent 在问你${qs.list.length > 1 ? `（${qs.list.length} 个问题）` : ''}</div>`
-    + qs.list.map((q, qi) => `<div class="qnQ">${qs.list.length > 1 ? `${qi + 1}. ` : ''}${esc(q.text)}</div><div class="qnOpts">`
+  bar.innerHTML = questionCard(`Agent 在问你<span class="qnCount">${qs.list.length} 个问题</span>`,
+    qs.list.map((q, qi) => `<div class="qnQ">${qs.list.length > 1 ? `${qi + 1}. ` : ''}${esc(q.text)}</div><div class="qnOpts">`
       + q.options.map((o, oi) => {
         const letter = String.fromCharCode(65 + oi);
         return o.free
           ? `<div class="qnFree ${o.sel ? 'on' : ''}"><input data-qi="${qi}" data-oi="${oi}" placeholder="其他…" value="${esc(o.value)}" enterkeyhint="done"><button data-qfree="${qi}:${oi}">填入</button></div>`
           : `<button class="qnOpt ${o.sel ? 'on' : ''}" data-qi="${qi}" data-oi="${oi}"><b>${letter}</b><span>${esc(o.label)}</span></button>`;
       }).join('') + '</div>').join('')
-    + `<div class="qnAct"><button data-qpart="skip">跳过</button><button class="primary" data-qpart="submit" ${qs.canSubmit ? '' : 'disabled'}>提交</button></div>`;
+    + `<div class="qnAct"><button data-qpart="skip">跳过</button><button class="primary" data-qpart="submit" ${qs.canSubmit ? '' : 'disabled'}>提交</button></div>`, open);
   bar.classList.add('show');
   questionBusy();
 }
@@ -1113,26 +1141,51 @@ function renderQueue(busy, queued, subs = [], readonly = false, changed = 0, qCo
   if (document.body.classList.contains('kb')) fitViewport();
 }
 
-function sendQueueAction(id, action, text) {
+let queueEditRequest = null;
+function sendQueueAction(id, action, text, requestId) {
   const echoes = pendingEchoes.filter(p => p.sel === viewSel && (action === 'clear'
     ? p.kind === 'queue' || p.represented : p.represented && p.queueId === id)).map(p => p.requestId);
-  return send({ t: 'queue', id, action, text, echoes });
+  return send({ t: 'queue', id, action, text, requestId, echoes });
 }
 function editQueued(id) {
   const q = (lastChat?.queued || []).find(x => x.id === id);
   if (!q) return status('这条排队消息已经不在了', false);
   if (currentApp === 'devin') { status('正在取出…'); return sendQueueAction(id, 'edit'); }
+  const edit = queueEditRequest = { id, sel: viewSel, requestId: crypto.randomUUID(), action: 'read' };
   openSheet('queueEdit', `<h3>修改排队消息</h3>
-    <textarea id="qEdit" style="width:100%;box-sizing:border-box;min-height:120px;max-height:50dvh;margin-bottom:10px"></textarea>
-    <button class="opt" id="qSave" style="justify-content:center;background:var(--accent);border-color:var(--accent-b);color:#fff;font-weight:600">保存（仍在排队）</button>`);
-  $('qEdit').value = q.t;
+    <textarea id="qEdit" disabled style="width:100%;box-sizing:border-box;min-height:120px;max-height:50dvh;margin-bottom:10px"></textarea>
+    <div id="qError" role="status">正在读取完整内容…</div>
+    <button class="opt" id="qSave" disabled style="justify-content:center;background:var(--accent);border-color:var(--accent-b);color:#fff;font-weight:600">保存（仍在排队）</button>`);
   $('qSave').onclick = () => {
+    if (edit.action === 'read') {
+      edit.requestId = crypto.randomUUID(); $('qSave').disabled = true;
+      $('qError').textContent = '正在读取完整内容…';
+      if (!sendQueueAction(id, 'read', undefined, edit.requestId)) receiveQueueEdit({ ...edit, ok: false, error: '连接已断开，请重试' });
+      return;
+    }
     const v = $('qEdit').value;
     if (!v.trim()) return status('内容不能为空；不想要这条就点「删除」', false);
-    sendQueueAction(id, 'edit', v);
-    closeSheet();
+    edit.requestId = crypto.randomUUID(); edit.action = 'edit';
+    $('qSave').disabled = true; $('qEdit').disabled = true; $('qError').textContent = '正在保存…';
+    if (!sendQueueAction(id, 'edit', v, edit.requestId)) receiveQueueEdit({ ...edit, ok: false, error: '连接已断开，内容已保留' });
     status('正在修改排队消息…');
   };
+  if (!sendQueueAction(id, 'read', undefined, edit.requestId)) receiveQueueEdit({ ...edit, ok: false, error: '连接已断开，请重试' });
+}
+function receiveQueueEdit(m) {
+  const edit = queueEditRequest;
+  if (!edit || sheetKind !== 'queueEdit' || edit.sel !== viewSel || m.sel !== edit.sel || m.requestId !== edit.requestId) return;
+  if (!m.ok) {
+    $('qError').textContent = m.error || '操作未完成，内容已保留';
+    $('qSave').disabled = false;
+    $('qEdit').disabled = edit.action === 'read';
+    if (edit.action === 'read') $('qSave').textContent = '重新读取';
+    return;
+  }
+  if (m.action === 'read') {
+    $('qEdit').value = m.text; $('qEdit').disabled = false; $('qSave').disabled = false;
+    $('qSave').textContent = '保存（仍在排队）'; $('qError').textContent = ''; edit.action = 'edit';
+  } else { queueEditRequest = null; closeSheet(); queueDraftSync(); }
 }
 
 $('queueBar').onclick = async e => {
@@ -1148,7 +1201,7 @@ $('queueBar').onclick = async e => {
   if (b.dataset.sub) {
     if (b.dataset.part === 'stop' && !await ask(`停止子 Agent「${b.dataset.sub}」？\n它做到一半的工作会中断。`, '停止')) return;
     send({ t: 'subagent', name: b.dataset.sub, part: b.dataset.part });
-    status(b.dataset.part === 'stop' ? '已停止子 Agent' : '正在打开子 Agent…');
+    status(b.dataset.part === 'stop' ? '正在停止子 Agent…' : '正在打开子 Agent…');
     return;
   }
   if (b.dataset.a === 'edit') return editQueued(b.dataset.q);
@@ -1407,8 +1460,8 @@ function requestOlderRemote() {
   if (currentApp === 'codex') {
     const orders = lastChat.items.map(it => it.order).filter(Number.isFinite);
     Object.assign(paging, { before: historyCursor ?? (orders.length ? Math.min(...orders) : null),
-      known: lastChat.items.map(it => it.i), details: executionRecordsShown() });
-  }
+      known: SC.key ? [...SC.items.keys()] : lastChat.items.map(it => it.i), details: executionRecordsShown() });
+  } else if (currentApp === 'cursor') paging.before = lastChat.items[0]?.i || null;
   if (send({ t: 'scrollChat', dy: -900, automatic: true, history: true, requestId: historyRequest.id, ...paging }) === false) {
     historyExpanded = historyRequest.expanded;
     clearHistoryRequest();
@@ -1593,12 +1646,13 @@ list.addEventListener('touchmove', e => {
 }, { passive: true });
 for (const event of ['touchend', 'touchcancel']) list.addEventListener(event, () => {
   if (!chatTouching) return;
-  chatMomentum = event === 'touchend';
+  chatMomentum = event === 'touchend' && chatUserScroll;
   if (event === 'touchcancel') bottomScrollIntent = null;
   chatTouching = false;
   restoringChatScroll = false;
   if (historyPullUp && list.scrollTop <= 1) historyArmed = true;
-  settleChatScroll();
+  if (!chatUserScroll) flushSettledChat();
+  else settleChatScroll();
 }, { passive: true });
 function jumpToLatest() {
   stopChatMotion(() => {
@@ -1823,7 +1877,7 @@ document.addEventListener('click', async e => {
 $('pickMode').onclick = () => requestMenu('mode', '读取模式列表…');
 $('pickModel').onclick = () => requestMenu('model', '读取模型列表…');
 $('pickPerm').onclick = () => requestMenu('permission', '读取权限…');
-function showCodexSkills(rows) {
+function showCodexSkills(rows, input = composerInput()) {
   openSheet('skills', '<h3>Skill · 技能</h3><input id="skillSearch" placeholder="搜索技能" style="width:100%;box-sizing:border-box;margin-bottom:8px"><div id="skillRows"></div>');
   const paint = () => {
     const q = $('skillSearch').value.toLowerCase();
@@ -1834,20 +1888,20 @@ function showCodexSkills(rows) {
     const b = e.target.closest('[data-skill]');
     if (!b) return;
     const r = rows[Number(b.dataset.skill)], token = '/' + r.label;
-    closeSheet(); text.focus();
-    text.setRangeText(token + ' ', text.selectionStart, text.selectionEnd, 'end');
-    MN.mentions.push({ ...r, token, at: text.selectionStart - token.length - 1 });
-    MN.value = text.value;
-    autosize(); saveDraft();
+    closeSheet(); input.focus();
+    input.setRangeText(token + ' ', input.selectionStart, input.selectionEnd, 'end');
+    MN.mentions.push({ ...r, token, at: input.selectionStart - token.length - 1 });
+    MN.value = input.value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
   };
   paint();
 }
 let codexFileRequest = 0;
-async function openCodexFilePicker(token) {
-  const scope = chatInputKey(), selected = new Map();
-  const start = token?.start ?? text.selectionStart, end = token?.end ?? token?.caret ?? text.selectionEnd;
+async function openCodexFilePicker(token, input = composerInput()) {
+  const scope = chatCacheKey(viewSel), selected = new Map();
+  const start = token?.start ?? input.selectionStart, end = token?.end ?? token?.caret ?? input.selectionEnd;
   let directory = null;
-  mentionHide();
+  mentionHide(input);
   const paint = (note = '') => {
     const showHidden = store.get('codex-files-show-hidden') === '1';
     const rows = (directory?.entries || []).map((entry, index) => !showHidden && entry.name.startsWith('.') ? '' : entry.directory
@@ -1869,8 +1923,8 @@ async function openCodexFilePicker(token) {
     };
     $('codexFileCancel').onclick = closeSheet;
     $('codexFileAdd').onclick = () => {
-      if (scope !== chatInputKey()) { closeSheet(); return status('会话已切换，请重新选择文件', false); }
-      if (takeMentions(text.value.slice(0, start) + text.value.slice(end)).length + selected.size > 12) return status('每条消息最多添加 12 个引用项', false);
+      if (scope !== chatCacheKey(viewSel) || input !== composerInput()) { closeSheet(); return status('会话已切换，请重新选择文件', false); }
+      if (takeMentions(input.value.slice(0, start) + input.value.slice(end)).length + selected.size > 12) return status('每条消息最多添加 12 个引用项', false);
       let at = start;
       const mentions = [...selected.values()].map(entry => {
         const token = '@' + entry.name;
@@ -1878,10 +1932,10 @@ async function openCodexFilePicker(token) {
         at += token.length + 1;
         return mention;
       });
-      text.setRangeText(mentions.map(m => m.token).join(' ') + (/\s/.test(text.value[end] || '') ? '' : ' '), start, end, 'end');
+      input.setRangeText(mentions.map(m => m.token).join(' ') + (/\s/.test(input.value[end] || '') ? '' : ' '), start, end, 'end');
       MN.mentions.push(...mentions);
-      MN.value = text.value;
-      closeSheet(); autosize(); saveDraft(); text.focus();
+      MN.value = input.value;
+      closeSheet(); input.dispatchEvent(new Event('input', { bubbles: true })); input.focus();
     };
   };
   const browse = async path => {
@@ -1898,13 +1952,13 @@ async function openCodexFilePicker(token) {
   };
   await browse('');
 }
-$('add').onclick = () => {
+function openComposerAdd(input = text) {
   if (currentApp === 'fusion') {
     openSheet('add', '<h3>添加附件</h3><button class="opt" data-control="img">上传图片</button><button class="opt" data-control="uploadDoc">上传文档</button>');
     $('sheet').querySelectorAll('[data-control]').forEach(b => b.onclick = () => { closeSheet(); $(b.dataset.control).click(); });
     return;
   }
-  const c = lastChat?.codex;
+  const c = (input === text ? lastChat : chatBySel.get(chatCacheKey(viewSel)))?.codex;
   if (!c) {
     const controls = ['newChat', 'pickMode', 'pickDir'].filter(id => !$(id).hidden);
     const editorRow = currentApp === 'devin'
@@ -1927,12 +1981,13 @@ $('add').onclick = () => {
     if (key === 'run') return send({ t: 'codexRun' });
     if (key === 'chat') return send({ t: 'codexChat' });
     if (key === 'skills') return send({ t: 'codexSkills' });
-    if (key === 'local-files') return openCodexFilePicker();
-    text.focus();
-    text.setRangeText(key === 'files' ? '@' : '/', text.selectionStart, text.selectionEnd, 'end');
-    autosize(); saveDraft(); mentionUpdate();
+    if (key === 'local-files') return openCodexFilePicker(undefined, input);
+    input.focus();
+    input.setRangeText(key === 'files' ? '@' : '/', input.selectionStart, input.selectionEnd, 'end');
+    input.dispatchEvent(new Event('input', { bubbles: true })); mentionUpdate(input);
   });
-};
+}
+$('add').onclick = () => openComposerAdd(text);
 $('pickPlan').onclick = () => { status('正在切换 Plan…'); send({ t: 'codexPlan' }); };
 $('pickIde').onclick = () => send({ t: 'codexIde' });
 $('pickRun').onclick = () => { status('读取执行位置…'); send({ t: 'codexRun' }); };
