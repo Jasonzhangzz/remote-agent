@@ -7,9 +7,9 @@ const store = {
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const themeName = () => ({ dark: '深色', light: '浅色', auto: '跟随系统' })[store.get('theme') || 'dark'];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const APP_VERSION = 'v373'; // keep in sync with the CACHE name in sw.js
+const APP_VERSION = 'v350'; // keep in sync with the CACHE name in sw.js
 
-let base = null, info = null, ws = null, authed = false;
+let base = null, info = null, ws = null, authed = false, failures = 0;
 let windowReady = false;
 let menuRequest = 0;
 let codexSettingsRequest = 0;
@@ -19,6 +19,7 @@ let crop = store.get('crop') !== 'full';
 let frame = { w: 1000, h: 800 }, panel = null, zoom = 1;
 let windows = [], currentWindow = null, appPlans = {};
 let currentApp = null;
+let editorBrowsing = false, editorDirectory = null, returnToEditor = null;
 let docsRequest = 0, docsPending = null;
 const agentLists = new Map();
 try {
@@ -73,8 +74,7 @@ function requestAgentCatalog() {
   if (authed && windowReady && !navigationPending && ['cursor', 'devin', 'codex'].includes(currentApp))
     return send({ t: 'agents', automatic: true, silent: true });
 }
-function openAgentList(refresh = false, entry = null) {
-  if (entry || sheetKind !== 'agents') projectEntry = entry || { computer: currentComputer().id, source: 'conversation' };
+function openAgentList(refresh = false) {
   const cached = agentLists.get(agentListKey());
   if (cached) showAgents(cached);
   else { openSheet('agents', '<h3>项目与会话</h3><p class="hint">正在读取 Agent 列表…</p>'); status('正在读取 Agent 列表…'); }
@@ -85,6 +85,7 @@ let currentAppName = I18N.tr('当前应用');
 let viewSel = '';
 // Only migrated agents declare capabilities; others retain their existing entry rules.
 let capabilityOwner = '', agentCapabilities = null, capabilityBlock = '';
+let fusionSideCapabilities = {};
 function supportsCapability(name, existing = true) {
   return capabilityOwner === currentApp && agentCapabilities ? agentCapabilities[name] === true : existing;
 }
@@ -211,16 +212,10 @@ function finishPending(list) {
 
 const desktopRequests = new Map();
 function desktopAction(obj) {
-  if (obj.t === 'overviewManage') return true;
   if (currentApp === 'fusion') return false;
   return obj.t === 'send' ? obj.submit !== false && mode !== 'terminal'
     : obj.t === 'queue' ? obj.action !== 'read'
     : ['stop', 'pickMenu', 'question', 'codexRequest', 'click', 'subagent', 'saveFile', 'sessionManage', 'sessionBatch', 'codexRename', 'codexArchive'].includes(obj.t);
-}
-function sendDesktopOperation(obj, computer = currentComputer()?.id || '', socket = ws, pending = {}) {
-  obj.operationId ||= crypto.randomUUID();
-  desktopRequests.set(obj.operationId, { computer, revision: 0, ...pending });
-  socket.send(JSON.stringify(obj));
 }
 function send(obj) {
   obj.sel ??= viewSel;
@@ -242,12 +237,15 @@ function send(obj) {
   if (obj.t === 'docs') {
     obj.requestId = ++docsRequest;
     docsPending = { id: obj.requestId, sel: viewSel, computer: currentComputer()?.id || '' };
+    editorBrowsing = obj.editor === true;
   }
   if (currentApp === 'codex' && ['settings', 'codexSetting', 'codexInstructions'].includes(obj.t)) obj.requestId = ++codexSettingsRequest;
   if (ws && ws.readyState === 1 && authed) {
-    if (desktopAction(obj)) sendDesktopOperation(obj);
-    else ws.send(JSON.stringify(obj));
-    return true;
+    if (desktopAction(obj)) {
+      obj.operationId ||= crypto.randomUUID();
+      desktopRequests.set(obj.operationId, { computer: currentComputer()?.id || '', revision: 0 });
+    }
+    ws.send(JSON.stringify(obj)); return true;
   }
   status('未连接', false);
   return false;

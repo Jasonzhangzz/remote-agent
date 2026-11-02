@@ -62,7 +62,7 @@ $('gateComputers').onclick = () => showComputers();
 let connGen = 0;
 function repairPairing() {
   connGen++;
-  clearComputerRetry(currentComputer());
+  clearTimeout(retryTimer);
   pending = null;
   authed = false;
   const old = ws;
