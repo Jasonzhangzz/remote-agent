@@ -34,7 +34,6 @@ const scReq = (mode, fn) => scDb().then(db => new Promise((res, rej) => {
 })).catch(() => null);
 const idbGet = k => scReq('readonly', s => s.get(k));
 const idbPut = (k, v) => scTrackWrite(k, scReq('readwrite', s => s.put(v, k)));
-let chatPreviewTimer = 0, chatPreviewDirty = false, computerResumeDirty = false, computerResumeAt = 0;
 const computerResumes = new Map();
 const computerResumeReady = idbGet('computer-resumes').then(saved => {
   for (const [id, value] of saved?.entries || []) {
@@ -55,9 +54,10 @@ function saveComputerResume(link) {
   return saveComputerResumes();
 }
 function saveComputerResumes() {
-  computerResumeDirty = true;
-  computerResumeAt = Date.now();
-  schedulePreviewSave();
+  const ids = new Set(loadComputers().map(c => c.id));
+  for (const id of computerResumes.keys()) if (!ids.has(id)) computerResumes.delete(id);
+  for (const [id, value] of computerResumes) value.folded = !!ovSt.get(id)?.folded && ovCollapsed.has(id);
+  return idbPut('computer-resumes', { at: Date.now(), entries: [...computerResumes], view: ovHistory() });
 }
 const chatCacheKey = sel => `${currentComputer()?.id || ''}|${sel}`;
 const chatPreviewGeneration = scGeneration, chatPreviewVersions = new Map(scVersions);
@@ -69,6 +69,7 @@ const chatPreviewReady = idbGet('chat-previews').then(entries => {
   }
   if (filtered && chatBySel.size) saveChatPreview();
 });
+let chatPreviewTimer = 0;
 function chatTail(items, limit) {
   const start = Math.max(0, items.length - limit);
   const head = items.slice(0, start).findLast(it => it.k === 'human');
@@ -76,37 +77,19 @@ function chatTail(items, limit) {
 }
 function cacheChat(sel, chat, computer = currentComputer()?.id || '') {
   const key = `${computer}|${sel}`;
-  const changed = chatBySel.get(key) !== chat;
   lruPut(chatBySel, key, chat, 12);
   if (key === SC.key) SC.cleared = false;
-  if (changed) saveChatPreview();
+  saveChatPreview();
 }
 function saveChatPreview() {
-  chatPreviewDirty = true;
-  schedulePreviewSave();
-}
-function schedulePreviewSave() {
   if (!chatPreviewTimer) chatPreviewTimer = setTimeout(function savePreview() {
     if (scClears.size || chatScrolling || chatTouching) { chatPreviewTimer = setTimeout(savePreview, 250); return; }
-    flushPreviewSaves();
-  }, 1000);
-}
-function flushPreviewSaves() {
-  clearTimeout(chatPreviewTimer); chatPreviewTimer = 0;
-  if (computerResumeDirty) {
-    computerResumeDirty = false;
-    const ids = new Set(loadComputers().map(c => c.id));
-    for (const id of computerResumes.keys()) if (!ids.has(id)) computerResumes.delete(id);
-    for (const [id, value] of computerResumes) value.folded = !!ovSt.get(id)?.folded && ovCollapsed.has(id);
-    idbPut('computer-resumes', { at: computerResumeAt, entries: [...computerResumes], view: ovHistory() });
-  }
-  if (chatPreviewDirty && !scClears.size) {
-    chatPreviewDirty = false;
+    chatPreviewTimer = 0;
     idbPut('chat-previews', [...chatBySel].map(([key, value]) => {
       const items = chatTail(value.items, 400);
       return [key, { ...value, items, earlier: items.length < value.items.length || value.earlier }];
     }));
-  }
+  }, 1000);
 }
 let chatFrame = 0, queuedChat = null, chatRenderEpoch = 0;
 function invalidateChatRender() {
@@ -241,8 +224,8 @@ function scDirty() {
   SC.dirty = true;
   if (!SC.timer) SC.timer = setTimeout(scFlush, 3000);
 }
-document.addEventListener('visibilitychange', () => { if (document.hidden) { scFlush(); scDrain(true); flushPreviewSaves(); } });
-addEventListener('pagehide', () => { scFlush(); scDrain(true); flushPreviewSaves(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { scFlush(); scDrain(true); } });
+addEventListener('pagehide', () => { scFlush(); scDrain(true); });
 function scSwitch(sess) {
   scFlush();
   SC.key = sess ? scKeyFor(sess) : null;
@@ -345,7 +328,6 @@ async function scClear(key) {
   clearTimeout(scDrainTimer); scDrainTimer = 0;
   if (scSaveFrame) { cancelAnimationFrame(scSaveFrame); scSaveFrame = 0; }
   clearTimeout(chatPreviewTimer); chatPreviewTimer = 0;
-  chatPreviewDirty = false;
   for (const pending of scPending.keys()) if (matches(pending)) scPending.delete(pending);
   for (const cached of chatBySel.keys()) if (matches(cached)) chatBySel.delete(cached);
   for (const title of Object.keys(scTitles)) if (matches(title)) delete scTitles[title];
@@ -366,7 +348,6 @@ async function scClear(key) {
   } finally {
     scClears.delete(clear);
     if (chatBySel.size) saveChatPreview();
-    else if (computerResumeDirty) schedulePreviewSave();
     scFlush(); scDrain();
   }
 }
@@ -768,7 +749,7 @@ function renderChat(chat, stale, loading = false, keepReading = true, historyIns
   $('pickRun').hidden = true;
   if (codexBar?.run) $('pickRun').textContent = codexBar.run;
   $('pickChat').hidden = true;
-  paintFusionRun(currentApp === 'fusion' ? chat?.fusionRun : null);
+  paintFusion(currentApp === 'fusion' ? chat?.fusion : null);
   chatBusy = !!chat?.busy;
   updateSendMode();
   currentSurface = chat?.surface || null;
@@ -930,6 +911,13 @@ itemsEl.addEventListener('click', e => { const b = e.target.closest('[data-codex
 $('taskChip').onclick = () => showTasks();
 itemsEl.addEventListener('toggle', e => { const id = e.target.dataset.task; if (id) e.target.open ? taskOpen.add(id) : taskOpen.delete(id); }, true);
 $('qnBar').addEventListener('click', e => {
+  const compose = e.target.closest('[data-question-compose]');
+  if (compose) {
+    setQuestionCompose(compose.dataset.questionCompose);
+    if (portraitComposer()) setComposerFold(false);
+    text.focus();
+    return;
+  }
   const b = e.target.closest('[data-action][data-request]');
   if (b) {
     const id = b.dataset.request, n = Number(b.dataset.action);
@@ -1034,8 +1022,8 @@ function renderQuestions(qs) {
       return `<section class="qnRequest"><div class="qnQ">${esc(heading)}</div>`
       + (remaining ? `<details class="qnDetails" data-question="${esc(r.id)}" ${expanded.has(r.id) ? 'open' : ''}><summary>展开问题详情</summary>${esc(remaining)}</details>` : '')
       + (r.id.startsWith('async:') ? `<div class="qnOpts">${r.buttons.slice(0, -2).map((b, n) => `<button class="qnOpt ${b.selected ? 'on' : ''}" data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div>` : '')
-      + r.fields.map((f, n) => `<label class="qnFree">${esc(f.label)}${f.options ? `<select data-request="${esc(r.id)}" data-field="${n}">${f.options.map(o => `<option value="${esc(o.value)}" ${o.value === f.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>` : `<input data-request="${esc(r.id)}" data-field="${n}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(f.value)}"${r.id.startsWith('async:') ? ' enterkeyhint="send"' : ''}>`}</label>`).join('')
-      + `<div class="qnAct">${r.buttons.map((b, n) => r.id.startsWith('async:') && n < r.buttons.length - 2 ? '' : `<button data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div></section>`; }).join(''), open);
+      + r.fields.map((f, n) => `<label class="qnFree">${esc(f.label)}${f.options ? `<select data-request="${esc(r.id)}" data-field="${n}">${f.options.map(o => `<option value="${esc(o.value)}" ${o.value === f.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>` : `<input data-request="${esc(r.id)}" data-field="${n}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(f.value)}">`}</label>`).join('')
+      + `<div class="qnAct">${r.id.startsWith('async:') ? `<button data-question-compose="${esc(r.id)}">在对话框回答</button>` : ''}${r.buttons.map((b, n) => r.id.startsWith('async:') && n < r.buttons.length - 2 ? '' : `<button data-request="${esc(r.id)}" data-action="${n}" aria-pressed="${!!b.selected}" ${b.disabled ? 'disabled' : ''}>${esc(b.label)}</button>`).join('')}</div></section>`; }).join(''), open);
     bar.classList.toggle('show', qs.requests.length > 0);
     bar.querySelectorAll('[data-field]').forEach(el => {
       const key = questionFieldKey(el);
@@ -1100,10 +1088,7 @@ $('qnBar').onclick = e => {
 };
 $('qnBar').addEventListener('keydown', e => {
   if (e.key !== 'Enter' || !e.target.matches('input')) return;
-  const answering = e.target.dataset.request?.startsWith('async:');
-  if (answering && e.isComposing) return;
   e.preventDefault();
-  if (answering) return e.target.closest('.qnRequest').querySelector('.qnAct button:last-child').click();
   if ('field' in e.target.dataset) { e.target.blur(); return; }
   e.target.nextElementSibling.click();
 });
@@ -1126,34 +1111,9 @@ function toggleChangeNotice() {
   if (hiddenChangeNotices.has(key)) hiddenChangeNotices.delete(key); else hiddenChangeNotices.add(key);
   renderQueue(lastChat?.busy, lastChat?.queued || [], lastChat?.subagents || [], lastChat?.readonly, lastChat?.changed, lastChat?.queuedCount);
 }
-function queuedMessages(queued = chatStale ? [] : lastChat?.queued || [], qCount = chatStale ? 0 : lastChat?.queuedCount) {
-  const devin = currentApp === 'devin';
-  const pending = pendingEchoes.filter(p => p.kind === 'queue' && p.sel === viewSel && !p.represented);
-  const nativeCount = Math.max(queued.length, devin ? qCount || 0 : 0);
-  const count = queued.length ? nativeCount + pending.length : Math.max(nativeCount, pending.length);
-  return { count, pending, queued, devin };
-}
-function queuedMessagesHtml({ count, pending, queued, devin }) {
-  return pending.map(p => `<div class="q pending"><span class="qt">${esc(p.text)}</span><span class="sub">${I18N.tr(p.syncing ? '正在同步…' : p.confirmed ? '已排队' : p.unknown ? '发送结果待确认' : '发送中…')}</span></div>`).join('')
-    + queued.map(q => `<div class="q"><span class="qt">${esc(q.t || '(空)')}</span>`
-      + (supportsCapability('queueEdit') ? ibtn('edit', devin ? '从队列取出，放回输入框' : '修改', `data-q="${esc(q.id)}" data-a="edit"`) : '')
-      + ibtn('enter', '打断当前这一轮，立刻发送', `data-q="${esc(q.id)}" data-a="send"`)
-      + ibtn('x', '删除', `data-q="${esc(q.id)}" data-a="remove"`, 'del') + '</div>').join('')
-    + (count && devin && !queued.length ? `<div class="q"><span class="qt">内容读不到，只显示数量</span></div>` : '');
-}
-const queueClearButton = queue => queue.devin ? ibtn('trash', '清空', 'data-a="clear" data-q=""', 'del') : '';
-function renderQueuedList(queue) {
-  const html = `<div class="qhRow"><span class="qh">排队中 ${queue.count} 条</span>${queue.count ? queueClearButton(queue) : ''}</div>`
-    + (queue.count ? queuedMessagesHtml(queue) : `<div class="hint">${I18N.tr('(空)')}</div>`);
-  if ($('queueList').innerHTML !== html) $('queueList').innerHTML = html;
-}
-function showQueuedMessages() {
-  openSheet('queued', '<h3>排队</h3><div id="queueList"></div>');
-  $('queueList').onclick = $('queueBar').onclick;
-  renderQueuedList(queuedMessages());
-}
 function renderQueue(busy, queued, subs = [], readonly = false, changed = 0, qCount = 0) {
-  const bar = $('queueBar'), queue = queuedMessages(queued, qCount);
+  const bar = $('queueBar');
+  const devin = currentApp === 'devin';
   let html = '';
   if (readonly && !chatStale && lastChat?.subagent) html += `<div class="run sub"><span>正在查看子 Agent 的对话（只读）</span>${ibtn('back', '返回主对话', 'data-main')}</div>`;
   if (subs.length && !readonly) {
@@ -1161,16 +1121,24 @@ function renderQueue(busy, queued, subs = [], readonly = false, changed = 0, qCo
     if (subsOpen) html += subs.map(n => `<div class="q"><span class="qt sa">${esc(n)}</span>`
       + ibtn('eye', '查看', `data-sub="${esc(n)}" data-part="open"`) + ibtn('stop', '停止', `data-sub="${esc(n)}" data-part="stop"`, 'del') + '</div>').join('');
   }
-  if (queue.count) {
-    html += `<div class="qhRow"><button class="qh fold" data-qfold aria-expanded="${queueOpen}">${queueOpen ? '▾' : '▸'} <span>排队中 ${queue.count} 条</span></button>${queueClearButton(queue)}</div>`;
-    if (queueOpen) html += queuedMessagesHtml(queue);
+  const pending = pendingEchoes.filter(p => p.kind === 'queue' && p.sel === viewSel && !p.represented);
+  const nativeCount = Math.max(queued.length, devin ? qCount || 0 : 0);
+  const n = queued.length ? nativeCount + pending.length : Math.max(nativeCount, pending.length);
+  if (n) {
+    html += `<div class="qhRow"><button class="qh fold" data-qfold aria-expanded="${queueOpen}">${queueOpen ? '▾' : '▸'} <span>排队中 ${n} 条</span></button>${devin ? ibtn('trash', '清空', 'data-a="clear" data-q=""', 'del') : ''}</div>`;
+  }
+  if (n && queueOpen) {
+    html += pending.map(p => `<div class="q pending"><span class="qt">${esc(p.text)}</span><span class="sub">${I18N.tr(p.syncing ? '正在同步…' : p.confirmed ? '已排队' : p.unknown ? '发送结果待确认' : '发送中…')}</span></div>`).join('');
+    html += queued.map(q => `<div class="q"><span class="qt">${esc(q.t || '(空)')}</span>`
+      + (supportsCapability('queueEdit') ? ibtn('edit', devin ? '从队列取出，放回输入框' : '修改', `data-q="${esc(q.id)}" data-a="edit"`) : '')
+      + ibtn('enter', '打断当前这一轮，立刻发送', `data-q="${esc(q.id)}" data-a="send"`)
+      + ibtn('x', '删除', `data-q="${esc(q.id)}" data-a="remove"`, 'del') + '</div>').join('');
+    if (devin && !queued.length) html += `<div class="q"><span class="qt">内容读不到，只显示数量</span></div>`;
   }
   if (changed && !readonly && !hiddenChangeNotices.has(changeNoticeKey())) html += `<div class="changesNotice"><button class="qh fold" data-changes>改动了 ${changed} 个文件 ›</button>${ibtn('x', '隐藏改动提示', 'data-toggle-changes')}</div>`;
   bar.innerHTML = html;
   bar.classList.toggle('show', Boolean(html));
-  if (sheetKind === 'queued') renderQueuedList(queue);
   if (document.body.classList.contains('kb')) fitViewport();
-  document.dispatchEvent(new Event('composer-state'));
 }
 
 let queueEditRequest = null;
@@ -1231,20 +1199,20 @@ $('queueBar').onclick = async e => {
   if ('fold' in b.dataset) { subsOpen = !subsOpen; return renderQueue(lastChat?.busy, lastChat?.queued || [], lastChat?.subagents || [], lastChat?.readonly, lastChat?.changed, lastChat?.queuedCount); }
   if ('main' in b.dataset) { send({ t: 'mainChat' }); status('返回主对话…'); return; }
   if (b.dataset.sub) {
-    if (b.dataset.part === 'stop' && !await ask(`停止子 Agent「${b.dataset.sub}」？\n它做到一半的工作会中断。`, '停止', true)) return;
+    if (b.dataset.part === 'stop' && !await ask(`停止子 Agent「${b.dataset.sub}」？\n它做到一半的工作会中断。`, '停止')) return;
     send({ t: 'subagent', name: b.dataset.sub, part: b.dataset.part });
     status(b.dataset.part === 'stop' ? '正在停止子 Agent…' : '正在打开子 Agent…');
     return;
   }
   if (b.dataset.a === 'edit') return editQueued(b.dataset.q);
   if (b.dataset.a === 'clear') {
-    if (!await ask('清空 Devin 的排队消息？', '清空', true)) return;
+    if (!await ask('清空 Devin 的排队消息？', '清空')) return;
     sendQueueAction('', 'clear');
     status('正在清空排队消息…');
     return;
   }
-  if (b.dataset.a === 'send' && !await ask('立即发送这条消息？\nAgent 当前这一轮会被打断。', '立即发送', true)) return;
-  if (b.dataset.a === 'remove' && !await ask('删除这条排队消息？', '删除', true)) return;
+  if (b.dataset.a === 'send' && !await ask('立即发送这条消息？\nAgent 当前这一轮会被打断。', '立即发送')) return;
+  if (b.dataset.a === 'remove' && !await ask('删除这条排队消息？', '删除')) return;
   sendQueueAction(b.dataset.q, b.dataset.a);
   status(b.dataset.a === 'send' ? '已立即发送这条排队消息' : '已删除这条排队消息');
 };
@@ -1985,7 +1953,11 @@ async function openCodexFilePicker(token, input = composerInput()) {
   await browse('');
 }
 function openComposerAdd(input = text) {
-  if (currentApp === 'fusion') return showFusionTasks(lastChat?.fusionRun);
+  if (currentApp === 'fusion') {
+    openSheet('add', '<h3>添加附件</h3><button class="opt" data-control="img">上传图片</button><button class="opt" data-control="uploadDoc">上传文档</button>');
+    $('sheet').querySelectorAll('[data-control]').forEach(b => b.onclick = () => { closeSheet(); $(b.dataset.control).click(); });
+    return;
+  }
   const c = (input === text ? lastChat : chatBySel.get(chatCacheKey(viewSel)))?.codex;
   if (!c) {
     const controls = ['newChat', 'pickMode', 'pickDir'].filter(id => !$(id).hidden);
